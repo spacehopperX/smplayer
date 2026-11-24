@@ -63,6 +63,8 @@ public:
 
 	void addForcedTitle(const QString & file, const QString & title) { forced_titles[file] = title; };
 
+	PlayerProcess * playerProcess() const { return proc; };
+
 protected:
 	//! Change the current state (Stopped, Playing or Paused)
 	//! And sends the stateChanged() signal.
