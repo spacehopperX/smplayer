@@ -1,0 +1,130 @@
+name: Build Windows 3D Fork Release
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { arch: 'x64', portable: false }
+          - { arch: 'x64', portable: true }
+
+    runs-on: windows-2022
+    env:
+      PORTABLE: ${{ matrix.config.portable }}
+
+    steps:
+      - name: Checkout smplayer-build harness
+        run: git clone https://github.com/smplayer-dev/smplayer-build.git .
+
+      - name: Checkout fork sources (installer)
+        if: ${{ matrix.config.portable == false }}
+        uses: actions/checkout@v4
+        with:
+          path: packages/smplayer
+          fetch-depth: 0
+
+      - name: Checkout fork sources (portable)
+        if: ${{ matrix.config.portable == true }}
+        uses: actions/checkout@v4
+        with:
+          path: packages/smplayer-portable
+          fetch-depth: 0
+
+      - name: Install themes and skins
+        run: |
+          git clone --depth 1 https://github.com/smplayer-dev/smplayer-themes.git packages\smplayer-themes
+          git clone --depth 1 https://github.com/smplayer-dev/smplayer-skins.git packages\smplayer-skins
+
+      - name: Install mplayer and mpv
+        run: .\uncompress_players.cmd
+
+      - name: Install Qt 5.15.2 (64-bit MinGW)
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '5.15.2'
+          arch: 'win64_mingw81'
+          tools: 'tools_mingw,qt.tools.win64_mingw810'
+
+      - name: Add MinGW to PATH
+        run: echo "$env:IQTA_TOOLS\mingw810_64\bin\" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Compile themes
+        run: .\compile_themes.cmd
+
+      - name: Compile SMPlayer
+        run: |
+          if ($env:PORTABLE -eq "true") {
+            .\compile_smplayer.cmd pe
+          } else {
+            .\compile_smplayer.cmd
+          }
+
+      - name: Stage build output
+        run: |
+          if ($env:PORTABLE -eq "true") {
+            .\install.cmd pe
+          } else {
+            .\install.cmd
+          }
+
+      - name: Create NSIS installer
+        if: ${{ matrix.config.portable == false }}
+        run: |
+          .\nsis.cmd
+          $filename = Get-Content packages\BUILD\installer_filename.txt -TotalCount 1
+          echo "PACKAGEFILENAME=$filename" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Rename installer
+        if: ${{ matrix.config.portable == false }}
+        shell: bash
+        run: |
+          installer=${{ env.PACKAGEFILENAME }}
+          filename=${installer/.exe/-unsigned.exe}
+          mv "packages/BUILD/output/$installer" "packages/BUILD/output/$filename"
+          echo "PACKAGEFILENAME=$filename" >> $GITHUB_ENV
+
+      - name: Create portable ZIP package
+        if: ${{ matrix.config.portable == true }}
+        shell: pwsh
+        run: |
+          .\create_portable_package.cmd
+          $orig = Get-Content packages\BUILD\portable_filename.txt -TotalCount 1
+          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($orig)
+          $zipName = "$baseName.zip"
+          $stagingDir = Get-ChildItem packages\BUILD\portable -Directory | Select-Object -First 1
+          if ($stagingDir) {
+            Compress-Archive -Path $stagingDir.FullName -DestinationPath "packages\BUILD\output\$zipName" -Force
+          } else {
+            Compress-Archive -Path "packages\BUILD\output\$orig" -DestinationPath "packages\BUILD\output\$zipName" -Force
+          }
+          echo "PACKAGEFILENAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGEFILENAME }}
+          path: packages\BUILD\output\${{ env.PACKAGEFILENAME }}
+
+      - name: Publish to GitHub Release (latest-dev)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-dev
+          name: "SMPlayer 3D Fork (Latest Build)"
+          body: "Automated Windows x64 installer and portable ZIP build from commit `${{ github.sha }}` on `${{ github.ref_name }}`."
+          prerelease: true
+          make_latest: true
+          files: |
+            packages/BUILD/output/${{ env.PACKAGEFILENAME }}
