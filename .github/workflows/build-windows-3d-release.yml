@@ -2,7 +2,7 @@ name: Build Windows 3D Fork Release
 
 on:
   push:
-    branches: [master, milestone-1-dual-screen]
+    branches: [master, milestone-1-dual-screen, milestone-2-3d-output]
   pull_request:
     branches: [master]
   workflow_dispatch:

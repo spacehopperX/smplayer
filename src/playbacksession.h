@@ -7,6 +7,7 @@
 #include "preferences.h"
 #include "preferencesdialog.h"
 #include "prefplaybackscreen.h"
+#include "stereo3dcontroller.h"
 #include "autohidewidget.h"
 #include "playerprocess.h"
 #include <QAction>
@@ -23,6 +24,7 @@ public:
     explicit PlaybackSession(SMPlayer *instance) : QObject(nullptr), app(instance) {
         qApp->installEventFilter(this);
         QObject::connect(qApp, &QGuiApplication::screenRemoved, this, [this](QScreen *screen) {
+            stereo.onScreenRemoved(screen->name());
             if (!active || !gui || screen->name() != current.name) return;
             if (viewport) viewport->hide();
             pendingDetach = true;
@@ -31,12 +33,14 @@ public:
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
         });
         QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
+            stereo.restoreDisplayMode();
             if (viewport) viewport->hide();
         });
         bindGui(app ? app->gui() : nullptr);
     }
     ~PlaybackSession() override {
         qApp->removeEventFilter(this);
+        stereo.restoreDisplayMode();
         if (viewport) viewport->hide();
         // The GUI owns the viewport. Core is destroyed before its video widget.
     }
@@ -77,6 +81,18 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    void reapplyViewportGeometry() {
+        if (!active || !viewport) return;
+        QTimer::singleShot(150, this, [this]() {
+            if (!active || !viewport) return;
+            if (QScreen *screen = PlaybackViewport::findScreenByName(current.name)) {
+                viewport->applyScreen(screen);
+            }
+        });
+    }
+    QString activeScreenName() const {
+        return active ? current.name : QString();
+    }
     void bindGui(BaseGui *window) {
         if (!window) return;
         gui = window;
@@ -91,13 +107,20 @@ private:
         QObject::connect(gui->getCore(), &Core::stateChanged, this, [this](Core::State state) {
             if (pendingDetach && state == Core::Stopped) {
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
+            } else if (state == Core::Stopped) {
+                if (active && viewport) viewport->setVideoVisible(false);
+                stereo.onPlaybackStopped(gui, [this]() { reapplyViewportGeometry(); });
             } else if (active && viewport) {
-                viewport->setVideoVisible(state != Core::Stopped);
+                viewport->setVideoVisible(true);
                 if (state == Core::Playing || state == Core::Paused) quietBackend();
             }
         });
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
             if (active) quietBackend();
+            stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); });
+        });
+        QObject::connect(gui->getCore(), &Core::mediaLoaded, this, [this]() {
+            stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); });
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (QCoreApplication::closingDown() || !app) return;
@@ -109,10 +132,17 @@ private:
             });
         });
 
-        auto *action = new QAction(tr("Playback Screen..."), gui);
-        action->setObjectName("configure_playback_screen");
-        gui->menuBar()->addAction(action);
-        QObject::connect(action, &QAction::triggered, this, [this]() { choose(); });
+        auto *screenAction = new QAction(tr("Playback Screen..."), gui);
+        screenAction->setObjectName("configure_playback_screen");
+        gui->menuBar()->addAction(screenAction);
+        QObject::connect(screenAction, &QAction::triggered, this, [this]() { choose(); });
+
+        auto *stereoAction = new QAction(tr("3D Output..."), gui);
+        stereoAction->setObjectName("configure_stereo_3d_output");
+        gui->menuBar()->addAction(stereoAction);
+        QObject::connect(stereoAction, &QAction::triggered, this, [this]() {
+            stereo.showDialog(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); });
+        });
     }
     void choose() {
         if (!gui) return;
@@ -175,6 +205,7 @@ private:
         return true;
     }
     void release() {
+        stereo.restoreDisplayMode();
         if (viewport && video && originalParent && viewport->isAttached())
             viewport->detachVideo(video, originalParent);
         if (gui) {
@@ -212,6 +243,7 @@ private:
     QMap<PreferencesDialog *, PrefPlaybackScreen *> editors;
     QMap<QAction *, bool> disabled;
     PlaybackScreenChoice current;
+    Stereo3DController stereo;
     int savedForceFullscreen = -1;
     bool active = false;
     bool pendingDetach = false;
