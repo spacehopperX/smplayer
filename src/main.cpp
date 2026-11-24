@@ -18,6 +18,10 @@
 
 #include "myapplication.h"
 #include "smplayer.h"
+#include <QMenuBar>
+#if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+#include "playbacksession.h"
+#endif
 
 #include <QDir>
 #ifdef USE_GL_WINDOW
@@ -31,128 +35,105 @@
 #ifdef PORTABLE_APP
 #ifdef Q_OS_WIN
 QString applicationPath() {
-	wchar_t my_path[_MAX_PATH+1];
-	GetModuleFileName(NULL, my_path,_MAX_PATH);
-	QString app_path = QString::fromWCharArray(my_path);
-	if (app_path.isEmpty()) return "";
-	QFileInfo fi(app_path);
-	return fi.absolutePath();
+    wchar_t my_path[_MAX_PATH+1];
+    GetModuleFileName(NULL, my_path,_MAX_PATH);
+    QString app_path = QString::fromWCharArray(my_path);
+    if (app_path.isEmpty()) return "";
+    QFileInfo fi(app_path);
+    return fi.absolutePath();
 }
 #else
 QString applicationPath() {
-	QString exe_file = QFile::symLinkTarget(QString("/proc/%1/exe").arg(QCoreApplication::applicationPid()));
-	return QFileInfo(exe_file).absolutePath();
+    QString exe_file = QFile::symLinkTarget(QString("/proc/%1/exe").arg(QCoreApplication::applicationPid()));
+    return QFileInfo(exe_file).absolutePath();
 }
 #endif
-#endif // PORTABLE_APP
+#endif
 
 QString hdpiConfig() {
 #ifdef PORTABLE_APP
-	// We can't use QCoreApplication::applicationDirPath() here
-	return applicationPath() + "/config";
+    return applicationPath() + "/config";
 #else
-	return Paths::configPath();
-#endif // PORTABLE_APP
+    return Paths::configPath();
+#endif
 }
-#endif // HDPI_SUPPORT
+#endif
 
-int main( int argc, char ** argv )
-{
+int main(int argc, char **argv) {
 #ifdef Q_OS_LINUX
-	#if QT_VERSION >= 0x050600
-	qputenv("QT_QPA_PLATFORM", QByteArray("xcb"));
-	#endif
+#if QT_VERSION >= 0x050600
+    qputenv("QT_QPA_PLATFORM", QByteArray("xcb"));
 #endif
-
+#endif
 #ifdef HDPI_SUPPORT
-	QString hdpi_config_path = hdpiConfig();
-	HDPISupport * hdpi = 0;
-	if (!hdpi_config_path.isEmpty()) {
-		hdpi = new HDPISupport(hdpi_config_path);
-	}
+    QString hdpi_config_path = hdpiConfig();
+    HDPISupport *hdpi = 0;
+    if (!hdpi_config_path.isEmpty()) hdpi = new HDPISupport(hdpi_config_path);
 #endif
-
-	MyApplication a( "smplayer", argc, argv );
-
+    MyApplication a("smplayer", argc, argv);
 #ifdef USE_GL_WINDOW
-	QSurfaceFormat fmt;
-	fmt.setVersion( 3, 2 );
-	fmt.setProfile( QSurfaceFormat::CoreProfile );
-	//fmt.setRenderableType(QSurfaceFormat::OpenGLES);
-	QSurfaceFormat::setDefaultFormat(fmt);
+    QSurfaceFormat fmt;
+    fmt.setVersion(3, 2);
+    fmt.setProfile(QSurfaceFormat::CoreProfile);
+    QSurfaceFormat::setDefaultFormat(fmt);
 #endif
-
-	/*
-	if (a.isRunning()) { 
-		qDebug("Another instance is running. Exiting.");
-		return 0;
-	}
-	*/
-
-	a.setQuitOnLastWindowClosed(false);
-	
+    a.setQuitOnLastWindowClosed(false);
 #ifdef Q_OS_WIN
-	// Change the working directory to the application path
-	QDir::setCurrent(a.applicationDirPath());
+    QDir::setCurrent(a.applicationDirPath());
 #endif
-
 #if QT_VERSION >= 0x040400
-	// Enable icons in menus
-	QCoreApplication::setAttribute(Qt::AA_DontShowIconsInMenus, false);
-	//QCoreApplication::setAttribute(Qt::AA_DontUseNativeMenuBar, true);
+    QCoreApplication::setAttribute(Qt::AA_DontShowIconsInMenus, false);
 #endif
-
-	// Sets the config path
-	QString config_path;
-
+    QString config_path;
 #ifdef PORTABLE_APP
-	config_path = a.applicationDirPath() + "/config";
+    config_path = a.applicationDirPath() + "/config";
 #else
-	// If a smplayer.ini exists in the app path, will use that path
-	// for the config file by default
-	if (QFile::exists( a.applicationDirPath() + "/smplayer.ini" ) ) {
-		config_path = a.applicationDirPath();
-		qDebug("main: using existing %s", QString(config_path + "/smplayer.ini").toUtf8().data());
-	}
+    if (QFile::exists(a.applicationDirPath() + "/smplayer.ini")) {
+        config_path = a.applicationDirPath();
+        qDebug("main: using existing %s", QString(config_path + "/smplayer.ini").toUtf8().data());
+    }
 #endif
-
 #ifdef Q_OS_WIN
-	QStringList args = a.winArguments();
+    QStringList args = a.winArguments();
 #else
-	QStringList args = a.arguments();
+    QStringList args = a.arguments();
 #endif
-	int pos = args.indexOf("-config-path");
-	if ( pos != -1) {
-		if (pos+1 < args.count()) {
-			pos++;
-			config_path = args[pos];
-			// Delete from list
-			args.removeAt(pos);
-			args.removeAt(pos-1);
-		} else {
-			printf("Error: expected parameter for -config-path\r\n");
-			return SMPlayer::ErrorArgument;
-		}
-	}
-
-	SMPlayer * smplayer = new SMPlayer(config_path);
-	#ifdef HDPI_SUPPORT
-	qDebug() << "main: hdpi_config_path:" << hdpi_config_path;
-	#endif
-	SMPlayer::ExitCode c = smplayer->processArgs( args );
-	if (c != SMPlayer::NoExit) {
-		return c;
-	}
-	smplayer->start();
-
-	int r = a.exec();
-
-	delete smplayer;
-
+    int pos = args.indexOf("-config-path");
+    if (pos != -1) {
+        if (pos+1 < args.count()) {
+            pos++;
+            config_path = args[pos];
+            args.removeAt(pos);
+            args.removeAt(pos-1);
+        } else {
+            printf("Error: expected parameter for -config-path\r\n");
+            return SMPlayer::ErrorArgument;
+        }
+    }
+    SMPlayer *smplayer = new SMPlayer(config_path);
 #ifdef HDPI_SUPPORT
-	if (hdpi != 0) delete hdpi;
+    qDebug() << "main: hdpi_config_path:" << hdpi_config_path;
 #endif
-
-	return r;
+    SMPlayer::ExitCode c = smplayer->processArgs(args);
+    if (c != SMPlayer::NoExit) {
+        delete smplayer;
+#ifdef HDPI_SUPPORT
+        delete hdpi;
+#endif
+        return c;
+    }
+#if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    PlaybackSession *playback = new PlaybackSession(smplayer->gui());
+    playback->initialize();
+#endif
+    smplayer->start();
+    int r = a.exec();
+#if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+    delete playback;
+#endif
+    delete smplayer;
+#ifdef HDPI_SUPPORT
+    delete hdpi;
+#endif
+    return r;
 }
-

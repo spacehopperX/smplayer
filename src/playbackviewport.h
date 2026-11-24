@@ -1,70 +1,91 @@
-/*  smplayer, GUI front-end for mplayer.
-    Copyright (C) 2006-2026 Ricardo Villalba <ricardo@smplayer.info>
-    Dual-screen 3D/2D playback viewport extensions (C) 2026 spacehopperX
-
-    This program is free software; you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation; either version 2 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-*/
-
+// SPDX-License-Identifier: GPL-2.0-or-later
 #ifndef PLAYBACKVIEWPORT_H
 #define PLAYBACKVIEWPORT_H
+#include "mplayerwindow.h"
+#include <QCloseEvent>
+#include <QGuiApplication>
+#include <QLayout>
+#include <QPalette>
+#include <QPointer>
+#include <QScreen>
+#include <QVBoxLayout>
+#include <QWindow>
 
-#include <QWidget>
-#include <QString>
-
-class QScreen;
-class QVBoxLayout;
-class MplayerWindow;
-
-/*!
- * Borderless fullscreen black viewport pinned to a dedicated playback display
- * (3D TV, projector, or secondary 2D monitor). Keeps SMPlayer's main control UI
- * on the operator's screen with zero OSD/UI distractions on the playback screen.
- */
-class PlaybackViewport : public QWidget
-{
-	Q_OBJECT
-
+class PlaybackViewport : public QWidget {
 public:
-	explicit PlaybackViewport(QWidget * parent = 0);
-	~PlaybackViewport();
-
-	//! Attach MplayerWindow into this fullscreen black viewport on \a screen.
-	void attachVideo(MplayerWindow * mpw, QScreen * screen);
-
-	//! Reposition/resize the viewport to match \a screen's full geometry.
-	void applyScreen(QScreen * screen);
-
-	//! Detach MplayerWindow back to \a target_parent's layout and hide viewport.
-	void detachVideo(MplayerWindow * mpw, QWidget * target_parent);
-
-	bool isAttached() const { return attached_window != 0; }
-	QString currentScreenName() const { return screen_name; }
-
-	//! Find a QScreen by its saved name, returning 0 if disconnected.
-	static QScreen * findScreenByName(const QString & name);
-
-	//! Human-readable label for a QScreen (e.g. "Display 2: \\.\DISPLAY2 (1920x2205 @ 30 Hz)").
-	static QString screenDescription(QScreen * screen, int index);
-
+    explicit PlaybackViewport(QWidget *owner = nullptr)
+        : QWidget(owner, Qt::Window | Qt::FramelessWindowHint) {
+        setObjectName("playback_viewport");
+        setWindowTitle(tr("SMPlayer Playback"));
+        setAutoFillBackground(true);
+        QPalette p = palette();
+        p.setColor(QPalette::Window, Qt::black);
+        setPalette(p);
+        setCursor(Qt::BlankCursor);
+        root = new QVBoxLayout(this);
+        root->setContentsMargins(0, 0, 0, 0);
+        root->setSpacing(0);
+    }
+    void attachVideo(MplayerWindow *video, QScreen *screen) {
+        if (!video || !screen) return;
+        if (attached != video) {
+            if (video->parentWidget() && video->parentWidget()->layout())
+                video->parentWidget()->layout()->removeWidget(video);
+            video->setParent(this);
+            root->addWidget(video);
+            attached = video;
+        }
+        video->setLogoVisible(false);
+        applyScreen(screen);
+    }
+    void applyScreen(QScreen *screen) {
+        if (!screen) return;
+        if (target != screen) {
+            if (target) QObject::disconnect(target.data(), nullptr, this, nullptr);
+            target = screen;
+            QObject::connect(screen, &QScreen::geometryChanged, this,
+                [this](const QRect &) { if (target) applyScreen(target); });
+        }
+        winId();
+        if (windowHandle()) windowHandle()->setScreen(screen);
+        setGeometry(screen->geometry());
+        showFullScreen();
+    }
+    void setVideoVisible(bool visible) {
+        if (attached) attached->setVisible(visible);
+    }
+    void detachVideo(MplayerWindow *video, QWidget *parent) {
+        if (attached == video && video && parent) {
+            root->removeWidget(video);
+            video->setParent(parent);
+            if (parent->layout()) parent->layout()->addWidget(video);
+            attached.clear();
+            video->show();
+        }
+        if (target) QObject::disconnect(target.data(), nullptr, this, nullptr);
+        target.clear();
+        hide();
+    }
+    bool isAttached() const { return !attached.isNull(); }
+    QString currentScreenName() const { return target ? target->name() : QString(); }
+    static QScreen *findScreenByName(const QString &name) {
+        for (QScreen *s : QGuiApplication::screens())
+            if (s->name() == name) return s;
+        return nullptr;
+    }
+    static QString screenDescription(QScreen *s, int index) {
+        if (!s) return QString();
+        const QSize size = s->size() * s->devicePixelRatio();
+        return tr("Display %1: %2 (%3x%4, %5 Hz)%6")
+            .arg(index + 1).arg(s->name()).arg(size.width()).arg(size.height())
+            .arg(s->refreshRate(), 0, 'f', 3)
+            .arg(s == QGuiApplication::primaryScreen() ? tr(" [Primary]") : QString());
+    }
 protected:
-	virtual void closeEvent(QCloseEvent * e);
-
+    void closeEvent(QCloseEvent *event) override { event->ignore(); }
 private:
-	QVBoxLayout * root_layout;
-	MplayerWindow * attached_window;
-	QString screen_name;
+    QVBoxLayout *root;
+    QPointer<MplayerWindow> attached;
+    QPointer<QScreen> target;
 };
-
 #endif
