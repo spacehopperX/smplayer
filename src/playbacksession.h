@@ -7,6 +7,7 @@
 #include "preferences.h"
 #include "preferencesdialog.h"
 #include "prefplaybackscreen.h"
+#include "mvcbluraybridge.h"
 #include "mvhevcbridge.h"
 #include "stereo3dcontroller.h"
 #include "autohidewidget.h"
@@ -35,7 +36,7 @@ public:
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
         });
         QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
-            mvhevc.stop();
+            stopBridges();
             stereo.restoreDisplayMode();
             if (viewport) viewport->hide();
         });
@@ -43,7 +44,7 @@ public:
     }
     ~PlaybackSession() override {
         qApp->removeEventFilter(this);
-        mvhevc.stop();
+        stopBridges();
         stereo.restoreDisplayMode();
         if (viewport) viewport->hide();
         // The GUI owns the viewport. Core is destroyed before its video widget.
@@ -85,6 +86,30 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    void stopBridges() {
+        mvhevc.stop();
+        mvcBluray.stop();
+    }
+    bool isAnyBridgeActive() const {
+        return mvhevc.isActive() || mvcBluray.isActive();
+    }
+    QString activeBridgeSummary() const {
+        if (mvhevc.isActive()) return mvhevc.summary();
+        if (mvcBluray.isActive()) return mvcBluray.summary();
+        return QString();
+    }
+    void redirectToBridgeStream(const QString &streamUrl, const QString &title) {
+        redirectingBridge = true;
+        QTimer::singleShot(150, this, [this, streamUrl, title]() {
+            if (!gui || !gui->getCore()) {
+                redirectingBridge = false;
+                return;
+            }
+            gui->getCore()->addForcedTitle(streamUrl, title);
+            gui->getCore()->openStream(streamUrl);
+            redirectingBridge = false;
+        });
+    }
     void reapplyViewportGeometry() {
         if (!active || !viewport) return;
         QTimer::singleShot(150, this, [this]() {
@@ -111,42 +136,45 @@ private:
         QObject::connect(gui->getCore(), &Core::aboutToStartPlaying, this, [this]() {
             if (!gui || !gui->getCore()) return;
             const QString file = gui->getCore()->mdat.filename;
-            if (mvhevc.isActiveUrl(file)) return;
-            if (redirectingMvHevc) return;
+            if (mvhevc.isActiveUrl(file) || mvcBluray.isActiveUrl(file)) return;
+            if (redirectingBridge) return;
 
-            mvhevc.stop();
+            stopBridges();
             stereo.setBridgeNote(QString());
-            if (!stereo.settings().enableMvHevcBridge) return;
 
-            const MvHevcProbe info = MvHevcBridge::probe(file, stereo.settings().ffmpegPath);
-            if (!info.isMvHevc) return;
-
-            QString err;
-            if (!mvhevc.start(file, info, stereo.settings().ffmpegPath, &err)) {
-                stereo.setBridgeNote(err);
-                return;
-            }
-
-            redirectingMvHevc = true;
-            const QString streamUrl = mvhevc.url();
-            const QString title = QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]");
-            QTimer::singleShot(150, this, [this, streamUrl, title]() {
-                if (!gui || !gui->getCore()) {
-                    redirectingMvHevc = false;
+            if (stereo.settings().enableMvHevcBridge) {
+                const MvHevcProbe info = MvHevcBridge::probe(file, stereo.settings().ffmpegPath);
+                if (info.isMvHevc) {
+                    QString err;
+                    if (!mvhevc.start(file, info, stereo.settings().ffmpegPath, &err)) {
+                        stereo.setBridgeNote(err);
+                        return;
+                    }
+                    redirectToBridgeStream(mvhevc.url(), QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]"));
                     return;
                 }
-                gui->getCore()->addForcedTitle(streamUrl, title);
-                gui->getCore()->openStream(streamUrl);
-                redirectingMvHevc = false;
-            });
+            }
+
+            if (stereo.settings().enableMvcBlurayBridge && MvcBlurayBridge::isCandidateFile(file)) {
+                const MvcBlurayProbe info = MvcBlurayBridge::probe(file, stereo.settings().ffmpegPath);
+                if (info.isMvc) {
+                    QString err;
+                    if (!mvcBluray.start(info, stereo.settings().ffmpegPath, stereo.settings().frimDecodePath, &err)) {
+                        stereo.setBridgeNote(err);
+                        return;
+                    }
+                    redirectToBridgeStream(mvcBluray.url(), QFileInfo(file).fileName() + QStringLiteral(" [MVC 3D]"));
+                    return;
+                }
+            }
         });
 
         QObject::connect(gui->getCore(), &Core::stateChanged, this, [this](Core::State state) {
             if (pendingDetach && state == Core::Stopped) {
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
             } else if (state == Core::Stopped) {
-                if (!redirectingMvHevc) {
-                    mvhevc.stop();
+                if (!redirectingBridge) {
+                    stopBridges();
                     if (active && viewport) viewport->setVideoVisible(false);
                     stereo.onPlaybackStopped(gui, [this]() { reapplyViewportGeometry(); });
                 }
@@ -158,11 +186,11 @@ private:
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
             if (active) quietBackend();
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                                       mvhevc.isActive(), mvhevc.summary());
+                                       isAnyBridgeActive(), activeBridgeSummary());
         });
         QObject::connect(gui->getCore(), &Core::mediaLoaded, this, [this]() {
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                                       mvhevc.isActive(), mvhevc.summary());
+                                       isAnyBridgeActive(), activeBridgeSummary());
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (QCoreApplication::closingDown() || !app) return;
@@ -184,7 +212,7 @@ private:
         gui->menuBar()->addAction(stereoAction);
         QObject::connect(stereoAction, &QAction::triggered, this, [this]() {
             stereo.showDialog(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                              mvhevc.isActive(), mvhevc.summary());
+                              isAnyBridgeActive(), activeBridgeSummary());
         });
     }
     void choose() {
@@ -248,7 +276,7 @@ private:
         return true;
     }
     void release() {
-        mvhevc.stop();
+        stopBridges();
         stereo.restoreDisplayMode();
         if (viewport && video && originalParent && viewport->isAttached())
             viewport->detachVideo(video, originalParent);
@@ -288,10 +316,11 @@ private:
     QMap<QAction *, bool> disabled;
     PlaybackScreenChoice current;
     MvHevcBridge mvhevc;
+    MvcBlurayBridge mvcBluray;
     Stereo3DController stereo;
     int savedForceFullscreen = -1;
     bool active = false;
     bool pendingDetach = false;
-    bool redirectingMvHevc = false;
+    bool redirectingBridge = false;
 };
 #endif

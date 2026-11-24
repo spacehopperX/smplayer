@@ -3,6 +3,7 @@
 #define STEREO3DCONTROLLER_H
 
 #include "displaymodeswitcher.h"
+#include "mvcbluraybridge.h"
 #include "mvhevcbridge.h"
 #include "stereo3dshaders.h"
 #include "stereo3dsubtitles.h"
@@ -41,6 +42,8 @@ struct Stereo3DSettings {
     bool preferGpuNext = true;
     bool enableMvHevcBridge = true;
     QString ffmpegPath;
+    bool enableMvcBlurayBridge = true;
+    QString frimDecodePath;
     bool enableStereoSubtitles = true;
     int subtitleDepthPx = 8;
     int subtitleFontSize = 52;
@@ -58,6 +61,8 @@ struct Stereo3DSettings {
         cfg.preferGpuNext = s.value("preferGpuNext", true).toBool();
         cfg.enableMvHevcBridge = s.value("enableMvHevcBridge", true).toBool();
         cfg.ffmpegPath = s.value("ffmpegPath").toString();
+        cfg.enableMvcBlurayBridge = s.value("enableMvcBlurayBridge", true).toBool();
+        cfg.frimDecodePath = s.value("frimDecodePath").toString();
         cfg.enableStereoSubtitles = s.value("enableStereoSubtitles", true).toBool();
         cfg.subtitleDepthPx = s.value("subtitleDepthPx", 8).toInt();
         cfg.subtitleFontSize = s.value("subtitleFontSize", 52).toInt();
@@ -76,6 +81,8 @@ struct Stereo3DSettings {
         s.setValue("preferGpuNext", preferGpuNext);
         s.setValue("enableMvHevcBridge", enableMvHevcBridge);
         s.setValue("ffmpegPath", ffmpegPath);
+        s.setValue("enableMvcBlurayBridge", enableMvcBlurayBridge);
+        s.setValue("frimDecodePath", frimDecodePath);
         s.setValue("enableStereoSubtitles", enableStereoSubtitles);
         s.setValue("subtitleDepthPx", subtitleDepthPx);
         s.setValue("subtitleFontSize", subtitleFontSize);
@@ -99,13 +106,13 @@ public:
                                    QWidget *parent = nullptr)
         : QDialog(parent), applyCallback(std::move(onApply)) {
         setWindowTitle(tr("3D Output Settings"));
-        setMinimumWidth(560);
+        setMinimumWidth(580);
 
         auto *root = new QVBoxLayout(this);
         auto *form = new QFormLayout();
 
         inputCombo = new QComboBox(this);
-        inputCombo->addItem(tr("Auto-detect (filename / resolution / MV-HEVC)"), Stereo3DSettings::InputAuto);
+        inputCombo->addItem(tr("Auto-detect (filename / resolution / MV-HEVC / MVC)"), Stereo3DSettings::InputAuto);
         inputCombo->addItem(tr("2D (Off)"), Stereo3DSettings::Input2D);
         inputCombo->addItem(tr("Side-by-Side (SBS)"), Stereo3DSettings::InputSBS);
         inputCombo->addItem(tr("Top-and-Bottom (TAB / OU)"), Stereo3DSettings::InputTAB);
@@ -159,17 +166,33 @@ public:
         auto *ffmpegRow = new QHBoxLayout();
         ffmpegEdit = new QLineEdit(initial.ffmpegPath, this);
         ffmpegEdit->setPlaceholderText(tr("Auto-detect (PATH / app folder)"));
-        auto *browseBtn = new QPushButton(tr("Browse..."), this);
+        auto *browseFfmpegBtn = new QPushButton(tr("Browse..."), this);
         ffmpegRow->addWidget(ffmpegEdit, 1);
-        ffmpegRow->addWidget(browseBtn);
+        ffmpegRow->addWidget(browseFfmpegBtn);
         form->addRow(tr("FFmpeg executable:"), ffmpegRow);
-        QObject::connect(browseBtn, &QPushButton::clicked, this, [this]() {
+        QObject::connect(browseFfmpegBtn, &QPushButton::clicked, this, [this]() {
             const QString chosen = QFileDialog::getOpenFileName(
                 this,
                 tr("Select FFmpeg Executable"),
                 ffmpegEdit->text(),
                 tr("Executables (*.exe);;All Files (*)"));
             if (!chosen.isEmpty()) ffmpegEdit->setText(chosen);
+        });
+
+        auto *frimRow = new QHBoxLayout();
+        frimEdit = new QLineEdit(initial.frimDecodePath, this);
+        frimEdit->setPlaceholderText(tr("Auto-detect FRIMDecode64.exe (optional if FFmpeg supports MVC)"));
+        auto *browseFrimBtn = new QPushButton(tr("Browse..."), this);
+        frimRow->addWidget(frimEdit, 1);
+        frimRow->addWidget(browseFrimBtn);
+        form->addRow(tr("FRIMDecode64 executable:"), frimRow);
+        QObject::connect(browseFrimBtn, &QPushButton::clicked, this, [this]() {
+            const QString chosen = QFileDialog::getOpenFileName(
+                this,
+                tr("Select FRIMDecode64 Executable"),
+                frimEdit->text(),
+                tr("Executables (*.exe);;All Files (*)"));
+            if (!chosen.isEmpty()) frimEdit->setText(chosen);
         });
 
         root->addLayout(form);
@@ -185,6 +208,10 @@ public:
         mvHevcCheck = new QCheckBox(tr("Auto-decode Apple MV-HEVC (Spatial Video) via real-time FFmpeg bridge (no disk re-encoding)"), this);
         mvHevcCheck->setChecked(initial.enableMvHevcBridge);
         root->addWidget(mvHevcCheck);
+
+        mvcBlurayCheck = new QCheckBox(tr("Auto-decode H.264 MVC / Blu-ray 3D ISO via real-time FFmpeg/FRIM bridge (no disk re-encoding)"), this);
+        mvcBlurayCheck->setChecked(initial.enableMvcBlurayBridge);
+        root->addWidget(mvcBlurayCheck);
 
         autoSwitchCheck = new QCheckBox(tr("Auto-switch playback display to 1920x2205 for 3D output (temporary; preserves CRU/EDID)"), this);
         autoSwitchCheck->setChecked(initial.autoSwitchDisplayMode);
@@ -227,6 +254,8 @@ public:
         cfg.preferGpuNext = gpuNextCheck->isChecked();
         cfg.enableMvHevcBridge = mvHevcCheck->isChecked();
         cfg.ffmpegPath = ffmpegEdit->text().trimmed();
+        cfg.enableMvcBlurayBridge = mvcBlurayCheck->isChecked();
+        cfg.frimDecodePath = frimEdit->text().trimmed();
         cfg.enableStereoSubtitles = stereoSubCheck->isChecked();
         cfg.subtitleDepthPx = subDepthSpin->value();
         cfg.subtitleFontSize = subFontSpin->value();
@@ -247,9 +276,11 @@ private:
     QSpinBox *subFontSpin;
     QSpinBox *subMarginSpin;
     QLineEdit *ffmpegEdit;
+    QLineEdit *frimEdit;
     QCheckBox *swapCheck;
     QCheckBox *stereoSubCheck;
     QCheckBox *mvHevcCheck;
+    QCheckBox *mvcBlurayCheck;
     QCheckBox *autoSwitchCheck;
     QCheckBox *restoreStopCheck;
     QCheckBox *gpuNextCheck;
@@ -333,18 +364,18 @@ public:
     void applyForActiveMedia(BaseGui *gui,
                              const QString &playbackScreenName,
                              const std::function<void()> &onDisplayModeChanged,
-                             bool mvHevcActive = false,
-                             const QString &mvHevcSummary = QString()) {
+                             bool bridgedTabActive = false,
+                             const QString &bridgeSummary = QString()) {
         if (!gui) return;
         Core *core = gui->getCore();
         if (!core) return;
 
-        if (mvHevcActive) {
+        if (bridgedTabActive) {
             lastDetection.input = Stereo3DSettings::InputTAB;
             lastDetection.swapped = false;
-            lastDetection.reason = mvHevcSummary.isEmpty()
-                ? QStringLiteral("Apple MV-HEVC (FFmpeg real-time bridge -> Full-TAB)")
-                : mvHevcSummary;
+            lastDetection.reason = bridgeSummary.isEmpty()
+                ? QStringLiteral("Real-time 3D bridge -> Full-TAB")
+                : bridgeSummary;
         } else {
             lastDetection = detectInput(core->mdat.filename, core->mdat.video_width, core->mdat.video_height);
         }
@@ -426,20 +457,20 @@ public:
     void showDialog(BaseGui *gui,
                     const QString &playbackScreenName,
                     const std::function<void()> &onDisplayModeChanged,
-                    bool mvHevcActive = false,
-                    const QString &mvHevcSummary = QString()) {
+                    bool bridgedTabActive = false,
+                    const QString &bridgeSummary = QString()) {
         if (!gui) return;
         const QString status = buildStatusSummary(playbackScreenName);
         Stereo3DControlDialog dialog(
             cfg,
             playbackScreenName,
             status,
-            [this, gui, playbackScreenName, onDisplayModeChanged, mvHevcActive, mvHevcSummary](const Stereo3DSettings &next) {
+            [this, gui, playbackScreenName, onDisplayModeChanged, bridgedTabActive, bridgeSummary](const Stereo3DSettings &next) {
                 cfg = next;
                 cfg.save();
                 ensureGpuNextIfConfigured();
                 if (gui->getCore()->state() != Core::Stopped) {
-                    applyForActiveMedia(gui, playbackScreenName, onDisplayModeChanged, mvHevcActive, mvHevcSummary);
+                    applyForActiveMedia(gui, playbackScreenName, onDisplayModeChanged, bridgedTabActive, bridgeSummary);
                 } else if (!cfg.autoSwitchDisplayMode) {
                     restoreDisplayMode(onDisplayModeChanged);
                 }
@@ -463,19 +494,22 @@ private:
 
     QString buildStatusSummary(const QString &screenName) const {
         const QString resolvedFfmpeg = MvHevcBridge::findExecutable(cfg.ffmpegPath, "ffmpeg");
-        QString s = QString("Detected input: %1\nActive shader: %2\nPlayback display mode: %3\nStereo subtitles: %4\nFFmpeg (MV-HEVC): %5")
+        const QString resolvedFrim = MvcBlurayBridge::findFrimExecutable(cfg.frimDecodePath);
+        QString s = QString(
+            "Detected input: %1\nActive shader: %2\nPlayback display mode: %3\nStereo subtitles: %4\nFFmpeg (MV-HEVC / MVC): %5\nFRIMDecode64 (H.264 MVC): %6")
             .arg(lastDetection.reason)
             .arg(activeShaderPath.isEmpty() ? QStringLiteral("None") : QFileInfo(activeShaderPath).fileName())
             .arg(DisplayModeSwitcher::currentModeSummary(screenName))
             .arg(cfg.enableStereoSubtitles
                  ? QString("Enabled (depth %1 px, size %2 px)").arg(cfg.subtitleDepthPx).arg(cfg.subtitleFontSize)
                  : QStringLiteral("Disabled"))
-            .arg(resolvedFfmpeg.isEmpty() ? QStringLiteral("Not found") : resolvedFfmpeg);
+            .arg(resolvedFfmpeg.isEmpty() ? QStringLiteral("Not found") : resolvedFfmpeg)
+            .arg(resolvedFrim.isEmpty() ? QStringLiteral("Not found") : resolvedFrim);
         if (!lastModeError.isEmpty()) {
             s += QString("\nLast mode-switch note: %1").arg(lastModeError);
         }
         if (!lastBridgeNote.isEmpty()) {
-            s += QString("\nMV-HEVC bridge note: %1").arg(lastBridgeNote);
+            s += QString("\n3D bridge note: %1").arg(lastBridgeNote);
         }
         return s;
     }
