@@ -3,6 +3,7 @@
 #define STEREO3DCONTROLLER_H
 
 #include "displaymodeswitcher.h"
+#include "mvhevcbridge.h"
 #include "stereo3dshaders.h"
 #include "basegui.h"
 #include "global.h"
@@ -13,9 +14,12 @@
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -33,6 +37,8 @@ struct Stereo3DSettings {
     bool restoreModeOnStop = true;
     int preferred3DRefreshHz = 0; // 0 = Auto (prefer 30 Hz)
     bool preferGpuNext = true;
+    bool enableMvHevcBridge = true;
+    QString ffmpegPath;
 
     static Stereo3DSettings load() {
         QSettings s(Paths::configPath() + "/stereo3d.ini", QSettings::IniFormat);
@@ -44,6 +50,8 @@ struct Stereo3DSettings {
         cfg.restoreModeOnStop = s.value("restoreModeOnStop", true).toBool();
         cfg.preferred3DRefreshHz = s.value("preferred3DRefreshHz", 0).toInt();
         cfg.preferGpuNext = s.value("preferGpuNext", true).toBool();
+        cfg.enableMvHevcBridge = s.value("enableMvHevcBridge", true).toBool();
+        cfg.ffmpegPath = s.value("ffmpegPath").toString();
         return cfg;
     }
 
@@ -56,6 +64,8 @@ struct Stereo3DSettings {
         s.setValue("restoreModeOnStop", restoreModeOnStop);
         s.setValue("preferred3DRefreshHz", preferred3DRefreshHz);
         s.setValue("preferGpuNext", preferGpuNext);
+        s.setValue("enableMvHevcBridge", enableMvHevcBridge);
+        s.setValue("ffmpegPath", ffmpegPath);
         s.sync();
     }
 };
@@ -75,13 +85,13 @@ public:
                                    QWidget *parent = nullptr)
         : QDialog(parent), applyCallback(std::move(onApply)) {
         setWindowTitle(tr("3D Output Settings"));
-        setMinimumWidth(500);
+        setMinimumWidth(540);
 
         auto *root = new QVBoxLayout(this);
         auto *form = new QFormLayout();
 
         inputCombo = new QComboBox(this);
-        inputCombo->addItem(tr("Auto-detect (filename / resolution)"), Stereo3DSettings::InputAuto);
+        inputCombo->addItem(tr("Auto-detect (filename / resolution / MV-HEVC)"), Stereo3DSettings::InputAuto);
         inputCombo->addItem(tr("2D (Off)"), Stereo3DSettings::Input2D);
         inputCombo->addItem(tr("Side-by-Side (SBS)"), Stereo3DSettings::InputSBS);
         inputCombo->addItem(tr("Top-and-Bottom (TAB / OU)"), Stereo3DSettings::InputTAB);
@@ -108,11 +118,31 @@ public:
         setComboByData(refreshCombo, initial.preferred3DRefreshHz);
         form->addRow(tr("1920x2205 refresh rate:"), refreshCombo);
 
+        auto *ffmpegRow = new QHBoxLayout();
+        ffmpegEdit = new QLineEdit(initial.ffmpegPath, this);
+        ffmpegEdit->setPlaceholderText(tr("Auto-detect (PATH / app folder)"));
+        auto *browseBtn = new QPushButton(tr("Browse..."), this);
+        ffmpegRow->addWidget(ffmpegEdit, 1);
+        ffmpegRow->addWidget(browseBtn);
+        form->addRow(tr("FFmpeg executable:"), ffmpegRow);
+        QObject::connect(browseBtn, &QPushButton::clicked, this, [this]() {
+            const QString chosen = QFileDialog::getOpenFileName(
+                this,
+                tr("Select FFmpeg Executable"),
+                ffmpegEdit->text(),
+                tr("Executables (*.exe);;All Files (*)"));
+            if (!chosen.isEmpty()) ffmpegEdit->setText(chosen);
+        });
+
         root->addLayout(form);
 
         swapCheck = new QCheckBox(tr("Swap Left / Right eyes"), this);
         swapCheck->setChecked(initial.swapEyes);
         root->addWidget(swapCheck);
+
+        mvHevcCheck = new QCheckBox(tr("Auto-decode Apple MV-HEVC (Spatial Video) via real-time FFmpeg bridge (no disk re-encoding)"), this);
+        mvHevcCheck->setChecked(initial.enableMvHevcBridge);
+        root->addWidget(mvHevcCheck);
 
         autoSwitchCheck = new QCheckBox(tr("Auto-switch playback display to 1920x2205 for 3D output (temporary; preserves CRU/EDID)"), this);
         autoSwitchCheck->setChecked(initial.autoSwitchDisplayMode);
@@ -153,6 +183,8 @@ public:
         cfg.autoSwitchDisplayMode = autoSwitchCheck->isChecked();
         cfg.restoreModeOnStop = restoreStopCheck->isChecked();
         cfg.preferGpuNext = gpuNextCheck->isChecked();
+        cfg.enableMvHevcBridge = mvHevcCheck->isChecked();
+        cfg.ffmpegPath = ffmpegEdit->text().trimmed();
         return cfg;
     }
 
@@ -165,7 +197,9 @@ private:
     QComboBox *inputCombo;
     QComboBox *outputCombo;
     QComboBox *refreshCombo;
+    QLineEdit *ffmpegEdit;
     QCheckBox *swapCheck;
+    QCheckBox *mvHevcCheck;
     QCheckBox *autoSwitchCheck;
     QCheckBox *restoreStopCheck;
     QCheckBox *gpuNextCheck;
@@ -184,6 +218,7 @@ public:
     }
 
     const Stereo3DSettings &settings() const { return cfg; }
+    void setBridgeNote(const QString &note) { lastBridgeNote = note; }
 
     void ensureGpuNextIfConfigured() {
         if (!cfg.preferGpuNext || !Global::pref) return;
@@ -247,12 +282,22 @@ public:
 
     void applyForActiveMedia(BaseGui *gui,
                              const QString &playbackScreenName,
-                             const std::function<void()> &onDisplayModeChanged) {
+                             const std::function<void()> &onDisplayModeChanged,
+                             bool mvHevcActive = false,
+                             const QString &mvHevcSummary = QString()) {
         if (!gui) return;
         Core *core = gui->getCore();
         if (!core) return;
 
-        lastDetection = detectInput(core->mdat.filename, core->mdat.video_width, core->mdat.video_height);
+        if (mvHevcActive) {
+            lastDetection.input = Stereo3DSettings::InputTAB;
+            lastDetection.swapped = false;
+            lastDetection.reason = mvHevcSummary.isEmpty()
+                ? QStringLiteral("Apple MV-HEVC (FFmpeg real-time bridge -> Full-TAB)")
+                : mvHevcSummary;
+        } else {
+            lastDetection = detectInput(core->mdat.filename, core->mdat.video_width, core->mdat.video_height);
+        }
 
         int effectiveInput = cfg.inputMode;
         bool effectiveSwap = cfg.swapEyes;
@@ -320,19 +365,21 @@ public:
 
     void showDialog(BaseGui *gui,
                     const QString &playbackScreenName,
-                    const std::function<void()> &onDisplayModeChanged) {
+                    const std::function<void()> &onDisplayModeChanged,
+                    bool mvHevcActive = false,
+                    const QString &mvHevcSummary = QString()) {
         if (!gui) return;
         const QString status = buildStatusSummary(playbackScreenName);
         Stereo3DControlDialog dialog(
             cfg,
             playbackScreenName,
             status,
-            [this, gui, playbackScreenName, onDisplayModeChanged](const Stereo3DSettings &next) {
+            [this, gui, playbackScreenName, onDisplayModeChanged, mvHevcActive, mvHevcSummary](const Stereo3DSettings &next) {
                 cfg = next;
                 cfg.save();
                 ensureGpuNextIfConfigured();
                 if (gui->getCore()->state() != Core::Stopped) {
-                    applyForActiveMedia(gui, playbackScreenName, onDisplayModeChanged);
+                    applyForActiveMedia(gui, playbackScreenName, onDisplayModeChanged, mvHevcActive, mvHevcSummary);
                 } else if (!cfg.autoSwitchDisplayMode) {
                     restoreDisplayMode(onDisplayModeChanged);
                 }
@@ -355,12 +402,17 @@ private:
     }
 
     QString buildStatusSummary(const QString &screenName) const {
-        QString s = QString("Detected input: %1\nActive shader: %2\nPlayback display mode: %3")
+        const QString resolvedFfmpeg = MvHevcBridge::findExecutable(cfg.ffmpegPath, "ffmpeg");
+        QString s = QString("Detected input: %1\nActive shader: %2\nPlayback display mode: %3\nFFmpeg (MV-HEVC): %4")
             .arg(lastDetection.reason)
             .arg(activeShaderPath.isEmpty() ? QStringLiteral("None") : QFileInfo(activeShaderPath).fileName())
-            .arg(DisplayModeSwitcher::currentModeSummary(screenName));
+            .arg(DisplayModeSwitcher::currentModeSummary(screenName))
+            .arg(resolvedFfmpeg.isEmpty() ? QStringLiteral("Not found") : resolvedFfmpeg);
         if (!lastModeError.isEmpty()) {
             s += QString("\nLast mode-switch note: %1").arg(lastModeError);
+        }
+        if (!lastBridgeNote.isEmpty()) {
+            s += QString("\nMV-HEVC bridge note: %1").arg(lastBridgeNote);
         }
         return s;
     }
@@ -370,6 +422,7 @@ private:
     Stereo3DDetection lastDetection;
     QString activeShaderPath;
     QString lastModeError;
+    QString lastBridgeNote;
 };
 
 #endif
