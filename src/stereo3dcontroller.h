@@ -5,6 +5,7 @@
 #include "displaymodeswitcher.h"
 #include "mvhevcbridge.h"
 #include "stereo3dshaders.h"
+#include "stereo3dsubtitles.h"
 #include "basegui.h"
 #include "global.h"
 #include "preferences.h"
@@ -23,6 +24,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSpinBox>
 #include <QVBoxLayout>
 #include <functional>
 
@@ -39,6 +41,10 @@ struct Stereo3DSettings {
     bool preferGpuNext = true;
     bool enableMvHevcBridge = true;
     QString ffmpegPath;
+    bool enableStereoSubtitles = true;
+    int subtitleDepthPx = 8;
+    int subtitleFontSize = 52;
+    int subtitleMarginY = 54;
 
     static Stereo3DSettings load() {
         QSettings s(Paths::configPath() + "/stereo3d.ini", QSettings::IniFormat);
@@ -52,6 +58,10 @@ struct Stereo3DSettings {
         cfg.preferGpuNext = s.value("preferGpuNext", true).toBool();
         cfg.enableMvHevcBridge = s.value("enableMvHevcBridge", true).toBool();
         cfg.ffmpegPath = s.value("ffmpegPath").toString();
+        cfg.enableStereoSubtitles = s.value("enableStereoSubtitles", true).toBool();
+        cfg.subtitleDepthPx = s.value("subtitleDepthPx", 8).toInt();
+        cfg.subtitleFontSize = s.value("subtitleFontSize", 52).toInt();
+        cfg.subtitleMarginY = s.value("subtitleMarginY", 54).toInt();
         return cfg;
     }
 
@@ -66,6 +76,10 @@ struct Stereo3DSettings {
         s.setValue("preferGpuNext", preferGpuNext);
         s.setValue("enableMvHevcBridge", enableMvHevcBridge);
         s.setValue("ffmpegPath", ffmpegPath);
+        s.setValue("enableStereoSubtitles", enableStereoSubtitles);
+        s.setValue("subtitleDepthPx", subtitleDepthPx);
+        s.setValue("subtitleFontSize", subtitleFontSize);
+        s.setValue("subtitleMarginY", subtitleMarginY);
         s.sync();
     }
 };
@@ -85,7 +99,7 @@ public:
                                    QWidget *parent = nullptr)
         : QDialog(parent), applyCallback(std::move(onApply)) {
         setWindowTitle(tr("3D Output Settings"));
-        setMinimumWidth(540);
+        setMinimumWidth(560);
 
         auto *root = new QVBoxLayout(this);
         auto *form = new QFormLayout();
@@ -118,6 +132,30 @@ public:
         setComboByData(refreshCombo, initial.preferred3DRefreshHz);
         form->addRow(tr("1920x2205 refresh rate:"), refreshCombo);
 
+        auto *subRow = new QHBoxLayout();
+        subDepthSpin = new QSpinBox(this);
+        subDepthSpin->setRange(-40, 40);
+        subDepthSpin->setSuffix(tr(" px"));
+        subDepthSpin->setValue(initial.subtitleDepthPx);
+        subDepthSpin->setToolTip(tr("Positive = closer to viewer (pop-out), 0 = screen plane, Negative = recessed behind screen"));
+
+        subFontSpin = new QSpinBox(this);
+        subFontSpin->setRange(20, 120);
+        subFontSpin->setPrefix(tr("Size "));
+        subFontSpin->setSuffix(tr(" px"));
+        subFontSpin->setValue(initial.subtitleFontSize);
+
+        subMarginSpin = new QSpinBox(this);
+        subMarginSpin->setRange(10, 300);
+        subMarginSpin->setPrefix(tr("Margin "));
+        subMarginSpin->setSuffix(tr(" px"));
+        subMarginSpin->setValue(initial.subtitleMarginY);
+
+        subRow->addWidget(subDepthSpin);
+        subRow->addWidget(subFontSpin);
+        subRow->addWidget(subMarginSpin);
+        form->addRow(tr("3D subtitle depth:"), subRow);
+
         auto *ffmpegRow = new QHBoxLayout();
         ffmpegEdit = new QLineEdit(initial.ffmpegPath, this);
         ffmpegEdit->setPlaceholderText(tr("Auto-detect (PATH / app folder)"));
@@ -139,6 +177,10 @@ public:
         swapCheck = new QCheckBox(tr("Swap Left / Right eyes"), this);
         swapCheck->setChecked(initial.swapEyes);
         root->addWidget(swapCheck);
+
+        stereoSubCheck = new QCheckBox(tr("Render stereoscopic 3D subtitles in Frame-Packed mode (text subs: SRT/ASS/VTT)"), this);
+        stereoSubCheck->setChecked(initial.enableStereoSubtitles);
+        root->addWidget(stereoSubCheck);
 
         mvHevcCheck = new QCheckBox(tr("Auto-decode Apple MV-HEVC (Spatial Video) via real-time FFmpeg bridge (no disk re-encoding)"), this);
         mvHevcCheck->setChecked(initial.enableMvHevcBridge);
@@ -185,6 +227,10 @@ public:
         cfg.preferGpuNext = gpuNextCheck->isChecked();
         cfg.enableMvHevcBridge = mvHevcCheck->isChecked();
         cfg.ffmpegPath = ffmpegEdit->text().trimmed();
+        cfg.enableStereoSubtitles = stereoSubCheck->isChecked();
+        cfg.subtitleDepthPx = subDepthSpin->value();
+        cfg.subtitleFontSize = subFontSpin->value();
+        cfg.subtitleMarginY = subMarginSpin->value();
         return cfg;
     }
 
@@ -197,8 +243,12 @@ private:
     QComboBox *inputCombo;
     QComboBox *outputCombo;
     QComboBox *refreshCombo;
+    QSpinBox *subDepthSpin;
+    QSpinBox *subFontSpin;
+    QSpinBox *subMarginSpin;
     QLineEdit *ffmpegEdit;
     QCheckBox *swapCheck;
+    QCheckBox *stereoSubCheck;
     QCheckBox *mvHevcCheck;
     QCheckBox *autoSwitchCheck;
     QCheckBox *restoreStopCheck;
@@ -340,12 +390,22 @@ public:
         }
 
         applyShaderToProcess(core->playerProcess(), shader, needFramePackingMode);
+        stereoSubtitles.apply(
+            core->playerProcess(),
+            needFramePackingMode && cfg.enableStereoSubtitles,
+            cfg.subtitleDepthPx,
+            cfg.subtitleFontSize,
+            cfg.subtitleMarginY,
+            effectiveSwap);
     }
 
     void onPlaybackStopped(BaseGui *gui, const std::function<void()> &onDisplayModeChanged) {
         if (gui && gui->getCore()) {
             applyShaderToProcess(gui->getCore()->playerProcess(), Stereo3DShaders::None, false);
+            stereoSubtitles.apply(gui->getCore()->playerProcess(), false, cfg.subtitleDepthPx,
+                                  cfg.subtitleFontSize, cfg.subtitleMarginY, cfg.swapEyes);
         }
+        stereoSubtitles.reset();
         if (cfg.restoreModeOnStop && modeSwitcher.isSwitched()) {
             modeSwitcher.restore();
             if (onDisplayModeChanged) onDisplayModeChanged();
@@ -403,10 +463,13 @@ private:
 
     QString buildStatusSummary(const QString &screenName) const {
         const QString resolvedFfmpeg = MvHevcBridge::findExecutable(cfg.ffmpegPath, "ffmpeg");
-        QString s = QString("Detected input: %1\nActive shader: %2\nPlayback display mode: %3\nFFmpeg (MV-HEVC): %4")
+        QString s = QString("Detected input: %1\nActive shader: %2\nPlayback display mode: %3\nStereo subtitles: %4\nFFmpeg (MV-HEVC): %5")
             .arg(lastDetection.reason)
             .arg(activeShaderPath.isEmpty() ? QStringLiteral("None") : QFileInfo(activeShaderPath).fileName())
             .arg(DisplayModeSwitcher::currentModeSummary(screenName))
+            .arg(cfg.enableStereoSubtitles
+                 ? QString("Enabled (depth %1 px, size %2 px)").arg(cfg.subtitleDepthPx).arg(cfg.subtitleFontSize)
+                 : QStringLiteral("Disabled"))
             .arg(resolvedFfmpeg.isEmpty() ? QStringLiteral("Not found") : resolvedFfmpeg);
         if (!lastModeError.isEmpty()) {
             s += QString("\nLast mode-switch note: %1").arg(lastModeError);
@@ -419,6 +482,7 @@ private:
 
     Stereo3DSettings cfg;
     DisplayModeSwitcher modeSwitcher;
+    Stereo3DSubtitles stereoSubtitles;
     Stereo3DDetection lastDetection;
     QString activeShaderPath;
     QString lastModeError;
