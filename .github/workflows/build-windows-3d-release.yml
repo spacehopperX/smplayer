@@ -2,129 +2,174 @@ name: Build Windows 3D Fork Release
 
 on:
   push:
-    branches:
-      - master
-    paths-ignore:
-      - 'README.md'
-      - 'docs/**'
+    branches: [master, milestone-1-dual-screen]
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: windows-packages-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    runs-on: windows-2022
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        config:
-          - { arch: 'x64', portable: false }
-          - { arch: 'x64', portable: true }
-
-    runs-on: windows-2022
-    env:
-      PORTABLE: ${{ matrix.config.portable }}
-
+        package: [installer, portable]
     steps:
-      - name: Checkout smplayer-build harness
-        run: git clone https://github.com/smplayer-dev/smplayer-build.git .
-
-      - name: Checkout fork sources (installer)
-        if: ${{ matrix.config.portable == false }}
+      - name: Checkout build harness
         uses: actions/checkout@v4
         with:
-          path: packages/smplayer
-          fetch-depth: 0
-
-      - name: Checkout fork sources (portable)
-        if: ${{ matrix.config.portable == true }}
+          repository: smplayer-dev/smplayer-build
+          path: harness
+      - name: Checkout application sources
         uses: actions/checkout@v4
         with:
-          path: packages/smplayer-portable
+          path: harness/packages/smplayer
           fetch-depth: 0
-
-      - name: Install themes and skins
-        run: |
-          git clone --depth 1 https://github.com/smplayer-dev/smplayer-themes.git packages\smplayer-themes
-          git clone --depth 1 https://github.com/smplayer-dev/smplayer-skins.git packages\smplayer-skins
-
-      - name: Install mplayer and mpv
-        run: .\uncompress_players.cmd
-
-      - name: Install Qt 5.15.2 (64-bit MinGW)
+      - name: Prepare portable sources
+        if: matrix.package == 'portable'
+        shell: pwsh
+        run: Move-Item harness/packages/smplayer harness/packages/smplayer-portable
+      - name: Install Qt and compiler
         uses: jurplel/install-qt-action@v3
         with:
           version: '5.15.2'
-          arch: 'win64_mingw81'
+          arch: win64_mingw81
           tools: 'tools_mingw,qt.tools.win64_mingw810'
-
-      - name: Add MinGW to PATH
-        run: echo "$env:IQTA_TOOLS\mingw810_64\bin\" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Compile themes
-        run: .\compile_themes.cmd
-
-      - name: Compile SMPlayer
-        run: |
-          if ($env:PORTABLE -eq "true") {
-            .\compile_smplayer.cmd pe
-          } else {
-            .\compile_smplayer.cmd
-          }
-
-      - name: Stage build output
-        run: |
-          if ($env:PORTABLE -eq "true") {
-            .\install.cmd pe
-          } else {
-            .\install.cmd
-          }
-
-      - name: Create NSIS installer
-        if: ${{ matrix.config.portable == false }}
-        run: |
-          .\nsis.cmd
-          $filename = Get-Content packages\BUILD\installer_filename.txt -TotalCount 1
-          echo "PACKAGEFILENAME=$filename" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Rename installer
-        if: ${{ matrix.config.portable == false }}
-        shell: bash
-        run: |
-          installer=${{ env.PACKAGEFILENAME }}
-          filename=${installer/.exe/-unsigned.exe}
-          mv "packages/BUILD/output/$installer" "packages/BUILD/output/$filename"
-          echo "PACKAGEFILENAME=$filename" >> $GITHUB_ENV
-
-      - name: Create portable ZIP package
-        if: ${{ matrix.config.portable == true }}
+      - name: Add compiler to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "$env:IQTA_TOOLS\mingw810_64\bin"
+      - name: Fetch themes and skins
+        working-directory: harness
         shell: pwsh
         run: |
-          .\create_portable_package.cmd
-          $orig = Get-Content packages\BUILD\portable_filename.txt -TotalCount 1
-          $baseName = [System.IO.Path]::GetFileNameWithoutExtension($orig)
-          $zipName = "$baseName.zip"
-          $stagingDir = Get-ChildItem packages\BUILD\portable -Directory | Select-Object -First 1
-          if ($stagingDir) {
-            Compress-Archive -Path $stagingDir.FullName -DestinationPath "packages\BUILD\output\$zipName" -Force
-          } else {
-            Compress-Archive -Path "packages\BUILD\output\$orig" -DestinationPath "packages\BUILD\output\$zipName" -Force
+          git clone --depth 1 https://github.com/smplayer-dev/smplayer-themes.git packages/smplayer-themes
+          if ($LASTEXITCODE -ne 0) { throw 'Theme checkout failed' }
+          git clone --depth 1 https://github.com/smplayer-dev/smplayer-skins.git packages/smplayer-skins
+          if ($LASTEXITCODE -ne 0) { throw 'Skin checkout failed' }
+      - name: Unpack playback engines
+        working-directory: harness
+        shell: cmd
+        run: call uncompress_players.cmd
+      - name: Compile themes
+        working-directory: harness
+        shell: cmd
+        run: call compile_themes.cmd
+      - name: Compile installer application
+        if: matrix.package == 'installer'
+        working-directory: harness
+        shell: cmd
+        run: call compile_smplayer.cmd
+      - name: Compile portable application
+        if: matrix.package == 'portable'
+        working-directory: harness
+        shell: cmd
+        run: call compile_smplayer.cmd pe
+      - name: Stage installer application
+        if: matrix.package == 'installer'
+        working-directory: harness
+        shell: cmd
+        run: call install.cmd
+      - name: Stage portable application
+        if: matrix.package == 'portable'
+        working-directory: harness
+        shell: cmd
+        run: call install.cmd pe
+      - name: Validate staged runtime
+        working-directory: harness
+        shell: pwsh
+        env:
+          PACKAGE_KIND: ${{ matrix.package }}
+        run: |
+          $folder = if ($env:PACKAGE_KIND -eq 'portable') { 'smplayer-portable' } else { 'smplayer-build' }
+          $root = Join-Path 'packages/BUILD' $folder
+          foreach ($file in @('smplayer.exe', 'mpv/mpv.exe', 'platforms/qwindows.dll')) {
+            $path = Join-Path $root $file
+            if (!(Test-Path $path) -or (Get-Item $path).Length -eq 0) { throw "Missing runtime file: $path" }
           }
-          echo "PACKAGEFILENAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Upload workflow artifact
+          & (Join-Path (Resolve-Path $root) 'mpv/mpv.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'mpv runtime smoke test failed' }
+      - name: Build installer
+        if: matrix.package == 'installer'
+        working-directory: harness
+        shell: cmd
+        run: call nsis.cmd
+      - name: Package and verify deliverable
+        working-directory: harness
+        shell: pwsh
+        env:
+          PACKAGE_KIND: ${{ matrix.package }}
+        run: |
+          New-Item -ItemType Directory -Force ../deliverables | Out-Null
+          $short = '${{ github.sha }}'.Substring(0, 12)
+          if ($env:PACKAGE_KIND -eq 'portable') {
+            $output = "../deliverables/smplayer-$short-windows-x64-portable.zip"
+            Compress-Archive -Path packages/BUILD/smplayer-portable -DestinationPath $output -Force
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $output))
+            try {
+              $names = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+              foreach ($required in @('smplayer-portable/smplayer.exe', 'smplayer-portable/mpv/mpv.exe', 'smplayer-portable/platforms/qwindows.dll')) {
+                if ($required -notin $names) { throw "Portable ZIP missing $required" }
+              }
+            } finally { $zip.Dispose() }
+          } else {
+            $name = (Get-Content packages/BUILD/installer_filename.txt -TotalCount 1).Trim()
+            $source = Join-Path 'packages/BUILD/output' $name
+            if (!(Test-Path $source)) { throw "Installer missing: $source" }
+            Copy-Item $source "../deliverables/smplayer-$short-windows-x64-setup-unsigned.exe"
+          }
+          $files = @(Get-ChildItem ../deliverables -File)
+          if ($files.Count -ne 1 -or $files[0].Length -eq 0) { throw 'Invalid deliverable' }
+      - name: Upload validated package
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PACKAGEFILENAME }}
-          path: packages\BUILD\output\${{ env.PACKAGEFILENAME }}
+          name: windows-${{ matrix.package }}
+          path: deliverables/*
+          if-no-files-found: error
 
-      - name: Publish to GitHub Release (latest-dev)
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download both packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          path: release
+          merge-multiple: true
+      - name: Verify release set and generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          test "$(find . -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
+          sha256sum *.exe *.zip > SHA256SUMS.txt
+      - name: Publish commit-specific prerelease
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-dev
-          name: "SMPlayer 3D Fork (Latest Build)"
-          body: "Automated Windows x64 installer and portable ZIP build from commit `${{ github.sha }}` on `${{ github.ref_name }}`."
+          tag_name: dev-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          name: SMPlayer development build ${{ github.run_number }}
           prerelease: true
-          make_latest: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: |
+            Windows x64 development packages built from ${{ github.sha }}.
+            Installer is unsigned. Portable ZIP contains the unpacked application.
+            Successful packaging does not establish hardware playback compatibility.
           files: |
-            packages/BUILD/output/${{ env.PACKAGEFILENAME }}
+            release/*.exe
+            release/*.zip
+            release/SHA256SUMS.txt
