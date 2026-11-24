@@ -94,8 +94,14 @@ jobs:
             $path = Join-Path $root $file
             if (!(Test-Path $path) -or (Get-Item $path).Length -eq 0) { throw "Missing runtime file: $path" }
           }
-          & (Join-Path (Resolve-Path $root) 'mpv/mpv.exe') --version
-          if ($LASTEXITCODE -ne 0) { throw 'mpv runtime smoke test failed' }
+          $mpv = Join-Path (Resolve-Path $root) 'mpv/mpv.exe'
+          $stdout = Join-Path $env:RUNNER_TEMP "mpv-version-$($env:PACKAGE_KIND).txt"
+          $proc = Start-Process -FilePath $mpv -ArgumentList '--version' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout
+          $banner = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { '' }
+          Write-Host $banner
+          if ($proc.ExitCode -ne 0 -or $banner -notmatch 'mpv ') {
+            throw "mpv runtime smoke test failed (exit=$($proc.ExitCode))"
+          }
       - name: Build installer
         if: matrix.package == 'installer'
         working-directory: harness

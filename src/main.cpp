@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
         return c;
     }
 #if defined(Q_OS_WIN) && QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
-    PlaybackSession *playback = new PlaybackSession(smplayer->gui());
+    PlaybackSession *playback = new PlaybackSession(smplayer);
     playback->initialize();
 #endif
     smplayer->start();

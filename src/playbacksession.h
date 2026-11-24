@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #ifndef PLAYBACKSESSION_H
 #define PLAYBACKSESSION_H
+#include "smplayer.h"
 #include "basegui.h"
+#include "global.h"
+#include "preferences.h"
 #include "preferencesdialog.h"
 #include "prefplaybackscreen.h"
 #include "autohidewidget.h"
@@ -10,31 +13,18 @@
 #include <QApplication>
 #include <QEvent>
 #include <QMap>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QTimer>
 
 // Header-only integration uses typed Qt connections and needs no new moc target.
 class PlaybackSession : public QObject {
 public:
-    explicit PlaybackSession(BaseGui *window) : QObject(nullptr), gui(window) {
-        video = gui->findChild<MplayerWindow *>("mplayerwindow");
-        if (video) originalParent = video->parentWidget();
-        viewport = new PlaybackViewport(gui);
+    explicit PlaybackSession(SMPlayer *instance) : QObject(nullptr), app(instance) {
         qApp->installEventFilter(this);
-        QObject::connect(gui->getCore(), &Core::stateChanged, this, [this](Core::State state) {
-            if (pendingDetach && state == Core::Stopped) {
-                QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
-            } else if (active && viewport) {
-                viewport->setVideoVisible(state != Core::Stopped);
-                if (state == Core::Playing || state == Core::Paused) quietBackend();
-            }
-        });
-        QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
-            if (active) quietBackend();
-        });
         QObject::connect(qApp, &QGuiApplication::screenRemoved, this, [this](QScreen *screen) {
-            if (!active || screen->name() != current.name) return;
-            viewport->hide();
+            if (!active || !gui || screen->name() != current.name) return;
+            if (viewport) viewport->hide();
             pendingDetach = true;
             gui->getCore()->stop();
             if (gui->getCore()->state() == Core::Stopped)
@@ -43,10 +33,7 @@ public:
         QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
             if (viewport) viewport->hide();
         });
-        auto *action = new QAction(tr("Playback Screen..."), gui);
-        action->setObjectName("configure_playback_screen");
-        gui->menuBar()->addAction(action);
-        QObject::connect(action, &QAction::triggered, this, [this]() { choose(); });
+        bindGui(app ? app->gui() : nullptr);
     }
     ~PlaybackSession() override {
         qApp->removeEventFilter(this);
@@ -90,6 +77,43 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    void bindGui(BaseGui *window) {
+        if (!window) return;
+        gui = window;
+        video = gui->findChild<MplayerWindow *>("mplayerwindow");
+        originalParent = video ? video->parentWidget() : nullptr;
+        viewport = new PlaybackViewport(gui);
+        disabled.clear();
+        active = false;
+        pendingDetach = false;
+        savedForceFullscreen = gui->forceStartInFullscreen();
+
+        QObject::connect(gui->getCore(), &Core::stateChanged, this, [this](Core::State state) {
+            if (pendingDetach && state == Core::Stopped) {
+                QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
+            } else if (active && viewport) {
+                viewport->setVideoVisible(state != Core::Stopped);
+                if (state == Core::Playing || state == Core::Paused) quietBackend();
+            }
+        });
+        QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
+            if (active) quietBackend();
+        });
+        QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
+            if (QCoreApplication::closingDown() || !app) return;
+            QTimer::singleShot(0, this, [this]() {
+                if (QCoreApplication::closingDown() || !app) return;
+                bindGui(app->gui());
+                if (current.dedicated && PlaybackViewport::findScreenByName(current.name))
+                    apply(current);
+            });
+        });
+
+        auto *action = new QAction(tr("Playback Screen..."), gui);
+        action->setObjectName("configure_playback_screen");
+        gui->menuBar()->addAction(action);
+        QObject::connect(action, &QAction::triggered, this, [this]() { choose(); });
+    }
     void choose() {
         if (!gui) return;
         if (gui->getCore()->state() != Core::Stopped) {
@@ -119,14 +143,22 @@ private:
         }
         release();
         if (!next.dedicated) return true;
+
         const auto screens = QGuiApplication::screens();
-        if (screens.size() > 1 && gui->windowHandle() && gui->windowHandle()->screen() == screen) {
+        QScreen *guiScreen = gui->windowHandle()
+            ? gui->windowHandle()->screen()
+            : QGuiApplication::screenAt(gui->geometry().center());
+        if (!guiScreen) guiScreen = QGuiApplication::primaryScreen();
+        if (screens.size() > 1 && guiScreen == screen) {
             for (QScreen *other : screens) {
                 if (other == screen) continue;
                 gui->move(other->availableGeometry().topLeft() + QPoint(40, 40));
                 break;
             }
         }
+
+        savedForceFullscreen = gui->forceStartInFullscreen();
+        gui->setForceStartInFullscreen(0);
         active = true;
         current = next;
         for (QAction *action : gui->findChildren<QAction *>()) {
@@ -139,25 +171,40 @@ private:
         for (AutohideWidget *controls : video->findChildren<AutohideWidget *>()) controls->deactivate();
         viewport->attachVideo(video, screen);
         viewport->setVideoVisible(false);
+        quietBackend();
         return true;
     }
     void release() {
         if (viewport && video && originalParent && viewport->isAttached())
             viewport->detachVideo(video, originalParent);
-        for (auto it = disabled.begin(); it != disabled.end(); ++it) {
-            if (gui && gui->findChildren<QAction *>().contains(it.key())) it.key()->setEnabled(it.value());
+        if (gui) {
+            gui->setForceStartInFullscreen(savedForceFullscreen);
+            const auto actions = gui->findChildren<QAction *>();
+            for (auto it = disabled.begin(); it != disabled.end(); ++it) {
+                if (actions.contains(it.key())) it.key()->setEnabled(it.value());
+            }
         }
         disabled.clear();
         active = false;
+        restoreBackend();
     }
     void quietBackend() {
         if (!gui) return;
-        if (auto *process = gui->getCore()->findChild<PlayerProcess *>()) {
+        if (auto *process = gui->getCore()->playerProcess()) {
             process->enableOSDInCommands(false);
             process->setOSD(0);
             if (process->isMPV()) process->sendCommand("no-osd set osd-bar no");
         }
     }
+    void restoreBackend() {
+        if (!gui) return;
+        if (auto *process = gui->getCore()->playerProcess()) {
+            process->enableOSDInCommands(true);
+            if (Global::pref) process->setOSD(Global::pref->osd);
+            if (process->isMPV()) process->sendCommand("no-osd set osd-bar yes");
+        }
+    }
+    QPointer<SMPlayer> app;
     QPointer<BaseGui> gui;
     QPointer<MplayerWindow> video;
     QPointer<QWidget> originalParent;
@@ -165,6 +212,7 @@ private:
     QMap<PreferencesDialog *, PrefPlaybackScreen *> editors;
     QMap<QAction *, bool> disabled;
     PlaybackScreenChoice current;
+    int savedForceFullscreen = -1;
     bool active = false;
     bool pendingDetach = false;
 };
