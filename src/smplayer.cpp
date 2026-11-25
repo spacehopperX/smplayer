@@ -72,12 +72,16 @@ SMPlayer::SMPlayer(const QString & config_path, QObject * parent )
 	#if QT_VERSION >= 0x050000
 	qInstallMessageHandler( SMPlayer::myMessageOutput );
 	#else
-	qInstallMsgHandler( SMPlayer::myMessageOutput );
+	qInstallMessageHandler( SMPlayer::myMessageOutput );
 	#endif
 	allow_to_send_log_to_gui = true;
 #endif
 
+#ifdef SKINS
+	gui_to_use = "SkinGUI";
+#else
 	gui_to_use = "DefaultGUI";
+#endif
 
 	close_at_end = -1; // Not set
 	start_in_fullscreen = -1; // Not set
@@ -91,6 +95,14 @@ SMPlayer::SMPlayer(const QString & config_path, QObject * parent )
 	if (config_path.isEmpty()) createConfigDirectory();
 //#endif
 	global_init(config_path);
+
+#ifdef SKINS
+	if (settings && !settings->contains("gui/gui")) {
+		pref->gui = "SkinGUI";
+		if (!settings->contains("gui/iconset")) pref->iconset = "Gonzo";
+		if (!settings->contains("gui/qt_style")) pref->style = "Fusion";
+	}
+#endif
 
 	// Application translations
 	translator->load( pref->language );
@@ -762,24 +774,21 @@ void myMessageOutput( QtMsgType type, const char *msg ) {
 			fprintf( stderr, "Debug: %s\n", orig_line.toLocal8Bit().data() );
 			#endif
 			break;
-
 		case QtWarningMsg:
 			#ifndef NO_DEBUG_ON_CONSOLE
 			fprintf( stderr, "Warning: %s\n", orig_line.toLocal8Bit().data() );
 			#endif
 			break;
-
+		case QtFatalMsg:
+			#ifndef NO_DEBUG_ON_CONSOLE
+			fprintf( stderr, "Fatal: %s\n", orig_line.toLocal8Bit().data() );
+			#endif
+			break;
 		case QtCriticalMsg:
 			#ifndef NO_DEBUG_ON_CONSOLE
 			fprintf( stderr, "Critical: %s\n", orig_line.toLocal8Bit().data() );
 			#endif
 			break;
-
-		case QtFatalMsg:
-			#ifndef NO_DEBUG_ON_CONSOLE
-			fprintf( stderr, "Fatal: %s\n", orig_line.toLocal8Bit().data() );
-			#endif
-			abort();                    // deliberately core dump
 	}
 }
 */
