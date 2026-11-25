@@ -59,8 +59,8 @@ public:
             PIPE_ACCESS_OUTBOUND,
             PIPE_TYPE_BYTE | PIPE_WAIT,
             1,
-            2 * 1024 * 1024,
-            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+            4 * 1024 * 1024,
             0,
             nullptr);
         if (handle == INVALID_HANDLE_VALUE) return false;
@@ -76,7 +76,7 @@ public:
     void push(const QByteArray &data) {
         if (data.isEmpty() || stopping.loadRelaxed()) return;
         QMutexLocker lk(&mtx);
-        while (!stopping.loadRelaxed() && queueBytes > 16 * 1024 * 1024) {
+        while (!stopping.loadRelaxed() && queueBytes > 32 * 1024 * 1024) {
             spaceCv.wait(&mtx, 50);
         }
         if (stopping.loadRelaxed()) return;
@@ -162,7 +162,9 @@ private:
     QAtomicInt eof{0};
 };
 
-// Direct Blu-ray 3D BDAV (192-byte MPEG-TS) demuxer for PID 0x1011 (AVC base) + PID 0x1012 (MVC dependent).
+// Robust Blu-ray 3D BDAV (192-byte MPEG-TS) demuxer.
+// Reassembles complete PES packets for PID 0x1011 (AVC base) and PID 0x1012 (MVC dependent)
+// before feeding them to FRIMDecode64, ensuring pristine stream headers and perfect L/R sync.
 class SsifDemuxThread : public QThread {
 public:
     SsifDemuxThread(const QString &path,
@@ -196,12 +198,30 @@ protected:
         }
 
         constexpr int kPacketSize = 192;
-        constexpr int kBatchPackets = 1024;
+        constexpr int kBatchPackets = 2048;
         QByteArray readBuf(kPacketSize * kBatchPackets, Qt::Uninitialized);
-        QByteArray baseBuf;
-        QByteArray depBuf;
-        baseBuf.reserve(256 * 1024);
-        depBuf.reserve(256 * 1024);
+        QByteArray pesBase;
+        QByteArray pesDep;
+        pesBase.reserve(1024 * 1024);
+        pesDep.reserve(1024 * 1024);
+
+        auto flushPes = [](QByteArray &pes, WinNamedPipeFeeder *out) {
+            if (pes.size() < 6 || !out) {
+                pes.clear();
+                return;
+            }
+            const uchar *p = reinterpret_cast<const uchar *>(pes.constData());
+            if (p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01) {
+                int headerLen = 6;
+                if (pes.size() >= 9) {
+                    headerLen = 9 + p[8];
+                }
+                if (pes.size() > headerLen) {
+                    out->push(QByteArray::fromRawData(pes.constData() + headerLen, pes.size() - headerLen));
+                }
+            }
+            pes.clear();
+        };
 
         while (!stopping.loadRelaxed()) {
             const qint64 n = f.read(readBuf.data(), readBuf.size());
@@ -225,33 +245,21 @@ protected:
                         off += 1 + ts[4];
                     }
                     if (off < 188) {
-                        if (pusi && off + 9 <= 188 &&
-                            ts[off] == 0x00 && ts[off + 1] == 0x00 && ts[off + 2] == 0x01) {
-                            off += 9 + ts[off + 8];
+                        QByteArray &targetPes = (pid == 0x1011) ? pesBase : pesDep;
+                        WinNamedPipeFeeder *targetOut = (pid == 0x1011) ? baseOut : depOut;
+
+                        if (pusi) {
+                            flushPes(targetPes, targetOut);
                         }
-                        if (off < 188) {
-                            const char *payload = reinterpret_cast<const char *>(ts + off);
-                            const int len = 188 - off;
-                            if (pid == 0x1011) baseBuf.append(payload, len);
-                            else depBuf.append(payload, len);
-                        }
+                        targetPes.append(reinterpret_cast<const char *>(ts + off), 188 - off);
                     }
                 }
                 i += kPacketSize;
             }
-
-            if (baseBuf.size() >= 128 * 1024 && baseOut) {
-                baseOut->push(baseBuf);
-                baseBuf.clear();
-            }
-            if (depBuf.size() >= 128 * 1024 && depOut) {
-                depOut->push(depBuf);
-                depBuf.clear();
-            }
         }
 
-        if (!baseBuf.isEmpty() && baseOut) baseOut->push(baseBuf);
-        if (!depBuf.isEmpty() && depOut) depOut->push(depBuf);
+        flushPes(pesBase, baseOut);
+        flushPes(pesDep, depOut);
         if (baseOut) baseOut->finishInput();
         if (depOut) depOut->finishInput();
     }
