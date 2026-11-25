@@ -7,17 +7,20 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QObject>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
+#include <functional>
 #include <memory>
 
 struct MvHevcProbe {
     bool isMvHevc = false;
     int leftView = 1;
     int rightView = 0;
+    double durationSec = 0.0;
     QString summary;
 };
 
@@ -67,7 +70,7 @@ public:
             p.start(ffprobe, QStringList{
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream_side_data=",
+                "-show_entries", "stream_side_data=:format=duration",
                 "-of", "default=nw=1",
                 filePath
             });
@@ -81,6 +84,10 @@ public:
                         viewIds = line.mid(QStringLiteral("view_ids_available=").size()).split(',', Qt::SkipEmptyParts);
                     } else if (line.startsWith("view_pos_available=")) {
                         viewPos = line.mid(QStringLiteral("view_pos_available=").size()).split(',', Qt::SkipEmptyParts);
+                    } else if (line.startsWith("duration=")) {
+                        bool ok = false;
+                        const double dur = line.mid(QStringLiteral("duration=").size()).trimmed().toDouble(&ok);
+                        if (ok && dur > 0.0) result.durationSec = dur;
                     }
                 }
                 if (viewIds.size() >= 2) {
@@ -113,7 +120,9 @@ public:
     bool start(const QString &sourceFile,
                const MvHevcProbe &info,
                const QString &configuredFfmpeg,
-               QString *errorOut = nullptr) {
+               QString *errorOut = nullptr,
+               std::function<void(const QString &)> onBridgeNote = nullptr,
+               double startSec = 0.0) {
         stop();
         const QString ffmpeg = findExecutable(configuredFfmpeg, "ffmpeg");
         if (ffmpeg.isEmpty()) {
@@ -138,19 +147,51 @@ public:
         QStringList args;
         args << "-hide_banner"
              << "-loglevel" << "error"
-             << "-nostdin"
-             << "-i" << sourceFile
+             << "-nostdin";
+        if (startSec > 0.0) {
+            args << "-ss" << QString::number(startSec, 'f', 3);
+        }
+        args << "-i" << sourceFile
              << "-filter_complex" << filter
              << "-map" << "[v]"
-             << "-map" << "0:a?"
+             << "-map" << "0:a:0?"
              << "-c:v" << "rawvideo"
              << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "copy"
+             << "-c:a" << "pcm_s16le"
              << "-f" << "nut"
              << listenUrl;
 
+        intentionalStop = false;
+        stderrLog.clear();
+        noteCallback = std::move(onBridgeNote);
+
         auto process = std::make_unique<QProcess>();
         process->setProcessChannelMode(QProcess::MergedChannels);
+        QProcess *rawProc = process.get();
+        QObject::connect(rawProc, &QProcess::readyReadStandardOutput, [this, rawProc]() {
+            const QString chunk = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+            if (!chunk.isEmpty()) {
+                if (!stderrLog.isEmpty()) stderrLog += '\n';
+                stderrLog += chunk;
+                if (stderrLog.size() > 1024) stderrLog = stderrLog.right(1024);
+            }
+        });
+        QObject::connect(rawProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         [this, rawProc](int exitCode, QProcess::ExitStatus status) {
+            if (intentionalStop) return;
+            const QString tail = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+            if (!tail.isEmpty()) {
+                if (!stderrLog.isEmpty()) stderrLog += '\n';
+                stderrLog += tail;
+            }
+            if ((exitCode != 0 || status != QProcess::NormalExit) && noteCallback) {
+                const QString msg = stderrLog.isEmpty()
+                    ? QString("FFmpeg exited early (code %1)").arg(exitCode)
+                    : QString("FFmpeg exited (%1): %2").arg(exitCode).arg(stderrLog);
+                noteCallback(msg);
+            }
+        });
+
         process->start(ffmpeg, args);
         if (!process->waitForStarted(3000)) {
             if (errorOut) *errorOut = QString("Failed to launch FFmpeg: %1").arg(process->errorString());
@@ -161,10 +202,13 @@ public:
         activeUrl = QString("tcp://127.0.0.1:%1").arg(port);
         activeSource = sourceFile;
         activeSummary = info.summary;
+        activeProbe = info;
+        activeSeekOffsetSec = startSec;
         return true;
     }
 
     void stop() {
+        intentionalStop = true;
         if (proc) {
             if (proc->state() != QProcess::NotRunning) {
                 proc->terminate();
@@ -178,6 +222,8 @@ public:
         activeUrl.clear();
         activeSource.clear();
         activeSummary.clear();
+        activeProbe = MvHevcProbe();
+        activeSeekOffsetSec = 0.0;
     }
 
     bool isActive() const { return !activeUrl.isEmpty(); }
@@ -185,6 +231,9 @@ public:
     QString url() const { return activeUrl; }
     QString sourceFile() const { return activeSource; }
     QString summary() const { return activeSummary; }
+    double durationSec() const { return activeProbe.durationSec; }
+    double seekOffsetSec() const { return activeSeekOffsetSec; }
+    const MvHevcProbe &probeInfo() const { return activeProbe; }
 
 private:
     static bool containsMvHevcAtoms(const QString &filePath) {
@@ -205,6 +254,11 @@ private:
     QString activeUrl;
     QString activeSource;
     QString activeSummary;
+    MvHevcProbe activeProbe;
+    double activeSeekOffsetSec = 0.0;
+    QString stderrLog;
+    std::function<void(const QString &)> noteCallback;
+    bool intentionalStop = false;
 };
 
 #endif
