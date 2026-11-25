@@ -4,6 +4,7 @@
 #include "smplayer.h"
 #include "basegui.h"
 #include "global.h"
+#include "helper.h"
 #include "preferences.h"
 #include "preferencesdialog.h"
 #include "prefplaybackscreen.h"
@@ -12,6 +13,10 @@
 #include "stereo3dcontroller.h"
 #include "autohidewidget.h"
 #include "playerprocess.h"
+#include "timeslider.h"
+#ifdef SKINS
+#include "mediapanel.h"
+#endif
 #include <QAction>
 #include <QApplication>
 #include <QEvent>
@@ -19,7 +24,11 @@
 #include <QMap>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QSet>
 #include <QTimer>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 // Header-only integration uses typed Qt connections and needs no new moc target.
 class PlaybackSession : public QObject {
@@ -35,6 +44,18 @@ public:
             if (gui->getCore()->state() == Core::Stopped)
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
         });
+        QObject::connect(qApp, &QGuiApplication::screenAdded, this, [this](QScreen *screen) {
+            if (!screen || active || !gui) return;
+            if (!current.dedicated || current.name.isEmpty() || screen->name() != current.name) return;
+            if (gui->getCore()->state() == Core::Stopped) {
+                QTimer::singleShot(300, this, [this]() {
+                    if (!active && current.dedicated && PlaybackViewport::findScreenByName(current.name))
+                        apply(current);
+                });
+            } else {
+                pendingReattach = true;
+            }
+        });
         QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
             stopBridges();
             stereo.restoreDisplayMode();
@@ -46,8 +67,11 @@ public:
         qApp->removeEventFilter(this);
         stopBridges();
         stereo.restoreDisplayMode();
-        if (viewport) viewport->hide();
-        // The GUI owns the viewport. Core is destroyed before its video widget.
+        if (viewport) {
+            viewport->hide();
+            delete viewport;
+            viewport.clear();
+        }
     }
     void initialize() {
         current = PlaybackScreenChoice::load();
@@ -58,7 +82,31 @@ public:
     }
 protected:
     bool eventFilter(QObject *object, QEvent *event) override {
+        if (active && video && stereo.isFramePackedActive() &&
+            object == video->videoLayer() &&
+            (event->type() == QEvent::Move || event->type() == QEvent::Resize)) {
+            if (QWidget *vl = video->videoLayer()) {
+                if (vl->geometry() != video->rect()) {
+                    QTimer::singleShot(0, this, [this]() {
+                        if (active && video && stereo.isFramePackedActive()) {
+                            video->setAspect(0);
+                            if (QWidget *layer = video->videoLayer()) {
+                                if (layer->geometry() != video->rect()) layer->setGeometry(video->rect());
+                            }
+                        }
+                    });
+                }
+            }
+        }
         if (event->type() == QEvent::Show) {
+            if (auto *slider = qobject_cast<TimeSlider *>(object)) {
+                hookTimeSlider(slider);
+            }
+#ifdef SKINS
+            if (auto *panel = qobject_cast<MediaPanel *>(object)) {
+                hookMediaPanel(panel);
+            }
+#endif
             if (auto *dialog = qobject_cast<PreferencesDialog *>(object)) {
                 if (!editors.contains(dialog)) {
                     auto *page = new PrefPlaybackScreen(dialog);
@@ -76,7 +124,13 @@ protected:
             }
             if (active && video) {
                 if (object->objectName() == "mplayerwindowlogo") {
-                    if (auto *widget = qobject_cast<QWidget *>(object)) widget->hide();
+                    if (auto *widget = qobject_cast<QWidget *>(object)) {
+                        widget->hide();
+                        widget->lower();
+                        QTimer::singleShot(0, this, [this]() {
+                            if (active) hideLogo();
+                        });
+                    }
                 }
                 if (auto *controls = qobject_cast<AutohideWidget *>(object)) {
                     if (video->isAncestorOf(controls)) controls->deactivate();
@@ -86,28 +140,189 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    bool anyBridgeActive() const { return mvhevc.isActive() || mvc.isActive(); }
+    bool isBridgeUrl(const QString &url) const { return mvhevc.isActiveUrl(url) || mvc.isActiveUrl(url); }
+    QString activeBridgeSummary() const { return mvhevc.isActive() ? mvhevc.summary() : mvc.summary(); }
+    double activeBridgeDuration() const { return mvhevc.isActive() ? mvhevc.durationSec() : mvc.durationSec(); }
+    double activeBridgeSeekOffset() const { return mvhevc.isActive() ? mvhevc.seekOffsetSec() : mvc.seekOffsetSec(); }
     void stopBridges() {
         mvhevc.stop();
-        mvcBluray.stop();
+        mvc.stop();
+        lastBridgeSec = 0.0;
     }
-    bool isAnyBridgeActive() const {
-        return mvhevc.isActive() || mvcBluray.isActive();
+
+    static int seekbarResolution() {
+#ifdef SEEKBAR_RESOLUTION
+        return SEEKBAR_RESOLUTION;
+#else
+        return 100;
+#endif
     }
-    QString activeBridgeSummary() const {
-        if (mvhevc.isActive()) return mvhevc.summary();
-        if (mvcBluray.isActive()) return mvcBluray.summary();
-        return QString();
+    void hookTimeSlider(TimeSlider *slider) {
+        if (!slider || hookedSliders.contains(slider)) return;
+        hookedSliders.insert(slider);
+        QObject::connect(slider, &QObject::destroyed, this, [this, slider]() {
+            hookedSliders.remove(slider);
+        });
+        QObject::connect(slider, &TimeSlider::posChanged, this, [this, slider](int pos) {
+            if (!anyBridgeActive() || redirectingBridge) return;
+            const double dur = activeBridgeDuration();
+            if (dur <= 0.0) return;
+            const int maxVal = qMax(1, slider->maximum());
+            const double targetSec = (static_cast<double>(pos) / static_cast<double>(maxVal)) * dur;
+            seekActiveBridgeTo(targetSec);
+        });
     }
-    void redirectToBridgeStream(const QString &streamUrl, const QString &title) {
+#ifdef SKINS
+    void hookMediaPanel(MediaPanel *panel) {
+        if (!panel || hookedMediaPanels.contains(panel)) return;
+        hookedMediaPanels.insert(panel);
+        QObject::connect(panel, &QObject::destroyed, this, [this, panel]() {
+            hookedMediaPanels.remove(panel);
+        });
+        QObject::connect(panel, &MediaPanel::seekerChanged, this, [this](int pos) {
+            if (!anyBridgeActive() || redirectingBridge) return;
+            const double dur = activeBridgeDuration();
+            if (dur <= 0.0) return;
+            const double targetSec = (static_cast<double>(pos) / static_cast<double>(seekbarResolution())) * dur;
+            seekActiveBridgeTo(targetSec);
+        });
+    }
+#endif
+    void syncBridgeTimeline(double currentSec = -1.0) {
+        if (!gui || !gui->getCore() || !anyBridgeActive()) return;
+        const double dur = activeBridgeDuration();
+        if (dur <= 0.0) return;
+        if (currentSec >= 0.0) {
+            double clamped = qBound(0.0, currentSec, dur);
+            if (clamped < lastBridgeSec && (lastBridgeSec - clamped) < 1.5) {
+                clamped = lastBridgeSec;
+            }
+            lastBridgeSec = clamped;
+        }
+        const double displaySec = lastBridgeSec;
+        gui->getCore()->mdat.duration = dur;
+
+        for (TimeSlider *slider : hookedSliders) {
+            if (!slider) continue;
+            slider->setDuration(dur);
+            if (displaySec >= 0.0) {
+                const int maxVal = qMax(1, slider->maximum());
+                const int pos = qBound(0, qRound((displaySec / dur) * maxVal), maxVal);
+                slider->setPos(pos);
+            }
+        }
+#ifdef SKINS
+        const int res = seekbarResolution();
+        const int skinPos = (displaySec >= 0.0) ? qBound(0, qRound((displaySec / dur) * res), res) : 0;
+        const QString totalStr = Helper::formatTime(static_cast<int>(dur));
+        const QString elapsedStr = Helper::formatTime(static_cast<int>(qMax(0.0, displaySec)));
+        for (MediaPanel *panel : hookedMediaPanels) {
+            if (!panel) continue;
+            panel->setDuration(static_cast<int>(dur));
+            panel->setTotalText(totalStr);
+            if (displaySec >= 0.0) {
+                panel->setElapsedText(elapsedStr);
+                panel->setSeeker(skinPos);
+            }
+        }
+#endif
+    }
+    void configureBridgeMpvCache() {
+        if (!gui || !gui->getCore() || !anyBridgeActive()) return;
+        if (auto *process = gui->getCore()->playerProcess()) {
+            if (process->isMPV() && process->isRunning()) {
+                process->sendCommand("no-osd set demuxer-max-bytes 768MiB");
+                process->sendCommand("no-osd set demuxer-max-back-bytes 128MiB");
+                process->sendCommand("no-osd set demuxer-readahead-secs 4");
+                process->sendCommand("no-osd set cache-pause no");
+            }
+        }
+    }
+    void launchRedirectedStream(const QString &streamUrl, const QString &title, bool preSwitchDisplay) {
         redirectingBridge = true;
-        QTimer::singleShot(150, this, [this, streamUrl, title]() {
-            if (!gui || !gui->getCore()) {
-                redirectingBridge = false;
+        const quint64 gen = ++bridgeRedirectGen;
+
+        if (preSwitchDisplay && active && viewport) viewport->setVideoVisible(false);
+        gui->getCore()->stop();
+        bool switchedDisplay = false;
+        if (preSwitchDisplay) {
+            switchedDisplay = stereo.prepareFramePackingDisplay(
+                gui, activeScreenName(), [this]() { reapplyViewportGeometry(); });
+        }
+        const int openDelayMs = switchedDisplay ? 650 : 250;
+
+        QTimer::singleShot(openDelayMs, this, [this, gen, streamUrl, title]() {
+            if (!gui || !gui->getCore() || bridgeRedirectGen != gen || !isBridgeUrl(streamUrl)) {
+                if (bridgeRedirectGen == gen) redirectingBridge = false;
                 return;
             }
             gui->getCore()->addForcedTitle(streamUrl, title);
             gui->getCore()->openStream(streamUrl);
-            redirectingBridge = false;
+        });
+        QTimer::singleShot(8000, this, [this, gen]() {
+            if (bridgeRedirectGen == gen) redirectingBridge = false;
+        });
+    }
+    void seekActiveBridgeTo(double targetSec) {
+        if (!gui || !gui->getCore() || !anyBridgeActive() || redirectingBridge) return;
+        const double dur = activeBridgeDuration();
+        const double clamped = qBound(0.0, targetSec, qMax(0.0, dur - 1.0));
+        QString err;
+
+        if (mvhevc.isActive()) {
+            const QString source = mvhevc.sourceFile();
+            const MvHevcProbe info = mvhevc.probeInfo();
+            if (source.isEmpty()) return;
+            if (!mvhevc.start(source, info, stereo.settings().ffmpegPath, &err,
+                              [this](const QString &note) { stereo.setBridgeNote(note); },
+                              clamped)) {
+                stereo.setBridgeNote(err);
+                return;
+            }
+            lastBridgeSec = clamped;
+            launchRedirectedStream(mvhevc.url(), QFileInfo(source).fileName() + QStringLiteral(" [MV-HEVC 3D]"), false);
+        } else if (mvc.isActive()) {
+            const MvcBlurayProbe info = mvc.probeInfo();
+            if (info.mediaPath.isEmpty()) return;
+            const auto &cfg = stereo.settings();
+            if (!mvc.start(info, cfg.ffmpegPath, cfg.frimDecodePath,
+                           cfg.enableStereoSubtitles, cfg.subtitleDepthPx, cfg.swapEyes,
+                           &err, [this](const QString &note) { stereo.setBridgeNote(note); },
+                           clamped)) {
+                stereo.setBridgeNote(err);
+                return;
+            }
+            lastBridgeSec = clamped;
+            const QString label = !info.mountedIsoPath.isEmpty()
+                ? QFileInfo(info.mountedIsoPath).fileName()
+                : QFileInfo(info.mediaPath).fileName();
+            launchRedirectedStream(mvc.url(), label + QStringLiteral(" [MVC 3D]"), false);
+        }
+    }
+    void hideLogo() {
+        if (!video) return;
+        video->setLogoVisible(false);
+        if (auto *logo = video->findChild<QWidget *>("mplayerwindowlogo")) {
+            logo->hide();
+            logo->lower();
+        }
+        if (QWidget *vl = video->videoLayer()) {
+            vl->raise();
+#ifdef Q_OS_WIN
+            if (vl->testAttribute(Qt::WA_WState_Created)) {
+                SetWindowRgn(reinterpret_cast<HWND>(vl->winId()), nullptr, TRUE);
+            }
+#endif
+        }
+    }
+    void scheduleLogoClear() {
+        hideLogo();
+        QTimer::singleShot(0, this, [this]() {
+            if (gui && gui->getCore()->state() != Core::Stopped) hideLogo();
+        });
+        QTimer::singleShot(100, this, [this]() {
+            if (gui && gui->getCore()->state() != Core::Stopped) hideLogo();
         });
     }
     void reapplyViewportGeometry() {
@@ -117,6 +332,13 @@ private:
             if (QScreen *screen = PlaybackViewport::findScreenByName(current.name)) {
                 viewport->applyScreen(screen);
             }
+            if (video && stereo.isFramePackedActive()) {
+                video->setAspect(0);
+                if (QWidget *vl = video->videoLayer()) {
+                    if (vl->geometry() != video->rect()) vl->setGeometry(video->rect());
+                }
+            }
+            if (gui && gui->getCore()->state() != Core::Stopped) scheduleLogoClear();
         });
     }
     QString activeScreenName() const {
@@ -127,44 +349,64 @@ private:
         gui = window;
         video = gui->findChild<MplayerWindow *>("mplayerwindow");
         originalParent = video ? video->parentWidget() : nullptr;
+        hookedSliders.clear();
+        for (TimeSlider *slider : gui->findChildren<TimeSlider *>()) {
+            hookTimeSlider(slider);
+        }
+#ifdef SKINS
+        hookedMediaPanels.clear();
+        for (MediaPanel *panel : gui->findChildren<MediaPanel *>()) {
+            hookMediaPanel(panel);
+        }
+#endif
+        if (viewport) {
+            viewport->hide();
+            viewport->deleteLater();
+        }
         viewport = new PlaybackViewport(gui);
         disabled.clear();
         active = false;
         pendingDetach = false;
+        pendingReattach = false;
+        redirectingBridge = false;
+        lastBridgeSec = 0.0;
         savedForceFullscreen = gui->forceStartInFullscreen();
 
         QObject::connect(gui->getCore(), &Core::aboutToStartPlaying, this, [this]() {
             if (!gui || !gui->getCore()) return;
             const QString file = gui->getCore()->mdat.filename;
-            if (mvhevc.isActiveUrl(file) || mvcBluray.isActiveUrl(file)) return;
+            if (isBridgeUrl(file)) return;
             if (redirectingBridge) return;
 
             stopBridges();
             stereo.setBridgeNote(QString());
 
-            if (stereo.settings().enableMvHevcBridge) {
-                const MvHevcProbe info = MvHevcBridge::probe(file, stereo.settings().ffmpegPath);
+            const auto &cfg = stereo.settings();
+            if (cfg.enableMvHevcBridge) {
+                const MvHevcProbe info = MvHevcBridge::probe(file, cfg.ffmpegPath);
                 if (info.isMvHevc) {
                     QString err;
-                    if (!mvhevc.start(file, info, stereo.settings().ffmpegPath, &err)) {
+                    if (!mvhevc.start(file, info, cfg.ffmpegPath, &err,
+                                      [this](const QString &note) { stereo.setBridgeNote(note); })) {
                         stereo.setBridgeNote(err);
                         return;
                     }
-                    redirectToBridgeStream(mvhevc.url(), QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]"));
+                    launchRedirectedStream(mvhevc.url(), QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]"), true);
                     return;
                 }
             }
 
-            if (stereo.settings().enableMvcBlurayBridge && MvcBlurayBridge::isCandidateFile(file)) {
-                const MvcBlurayProbe info = MvcBlurayBridge::probe(file, stereo.settings().ffmpegPath);
+            if (cfg.enableMvcBlurayBridge && MvcBlurayBridge::isCandidateFile(file)) {
+                const MvcBlurayProbe info = MvcBlurayBridge::probe(file, cfg.ffmpegPath);
                 if (info.isMvc) {
                     QString err;
-                    if (!mvcBluray.start(info, stereo.settings().ffmpegPath, stereo.settings().frimDecodePath, &err)) {
+                    if (!mvc.start(info, cfg.ffmpegPath, cfg.frimDecodePath,
+                                   cfg.enableStereoSubtitles, cfg.subtitleDepthPx, cfg.swapEyes,
+                                   &err, [this](const QString &note) { stereo.setBridgeNote(note); })) {
                         stereo.setBridgeNote(err);
                         return;
                     }
-                    redirectToBridgeStream(mvcBluray.url(), QFileInfo(file).fileName() + QStringLiteral(" [MVC 3D]"));
-                    return;
+                    launchRedirectedStream(mvc.url(), QFileInfo(file).fileName() + QStringLiteral(" [MVC 3D]"), true);
                 }
             }
         });
@@ -177,22 +419,72 @@ private:
                     stopBridges();
                     if (active && viewport) viewport->setVideoVisible(false);
                     stereo.onPlaybackStopped(gui, [this]() { reapplyViewportGeometry(); });
+                    if (pendingReattach && !active) {
+                        pendingReattach = false;
+                        QTimer::singleShot(200, this, [this]() {
+                            if (!active && current.dedicated && PlaybackViewport::findScreenByName(current.name))
+                                apply(current);
+                        });
+                    }
                 }
             } else if (active && viewport) {
-                viewport->setVideoVisible(true);
+                if (!redirectingBridge) {
+                    viewport->setVideoVisible(true);
+                    scheduleLogoClear();
+                }
                 if (state == Core::Playing || state == Core::Paused) quietBackend();
+            } else if (state == Core::Playing || state == Core::Paused) {
+                scheduleLogoClear();
             }
         });
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
+            if (redirectingBridge && gui && gui->getCore() &&
+                isBridgeUrl(gui->getCore()->mdat.filename)) {
+                redirectingBridge = false;
+            }
+            if (active && viewport) viewport->setVideoVisible(true);
+            scheduleLogoClear();
             if (active) quietBackend();
+            configureBridgeMpvCache();
+            syncBridgeTimeline(lastBridgeSec);
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                                       isAnyBridgeActive(), activeBridgeSummary());
+                                       anyBridgeActive(), activeBridgeSummary());
         });
         QObject::connect(gui->getCore(), &Core::mediaLoaded, this, [this]() {
+            if (redirectingBridge && gui && gui->getCore() &&
+                isBridgeUrl(gui->getCore()->mdat.filename)) {
+                redirectingBridge = false;
+            }
+            if (active && viewport) viewport->setVideoVisible(true);
+            scheduleLogoClear();
+            configureBridgeMpvCache();
+            syncBridgeTimeline(lastBridgeSec);
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                                       isAnyBridgeActive(), activeBridgeSummary());
+                                       anyBridgeActive(), activeBridgeSummary());
         });
+        QObject::connect(gui->getCore(), &Core::showTime, this, [this](double sec) {
+            if (anyBridgeActive()) {
+                syncBridgeTimeline(activeBridgeSeekOffset() + sec);
+            }
+        });
+        QObject::connect(gui->getCore(), &Core::newDuration, this, [this](double) {
+            if (anyBridgeActive()) syncBridgeTimeline();
+        });
+#ifdef SEEKBAR_RESOLUTION
+        QObject::connect(gui->getCore(), &Core::positionChanged, this, [this](int) {
+            if (anyBridgeActive()) syncBridgeTimeline();
+        });
+#else
+        QObject::connect(gui->getCore(), &Core::posChanged, this, [this](int) {
+            if (anyBridgeActive()) syncBridgeTimeline();
+        });
+#endif
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
+            if (viewport) {
+                viewport->hide();
+                viewport->deleteLater();
+                viewport.clear();
+            }
             if (QCoreApplication::closingDown() || !app) return;
             QTimer::singleShot(0, this, [this]() {
                 if (QCoreApplication::closingDown() || !app) return;
@@ -212,7 +504,7 @@ private:
         gui->menuBar()->addAction(stereoAction);
         QObject::connect(stereoAction, &QAction::triggered, this, [this]() {
             stereo.showDialog(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
-                              isAnyBridgeActive(), activeBridgeSummary());
+                              anyBridgeActive(), activeBridgeSummary());
         });
     }
     void choose() {
@@ -232,6 +524,7 @@ private:
     }
     bool apply(const PlaybackScreenChoice &next) {
         if (!gui || !video || !viewport) return false;
+        pendingReattach = false;
         if (active == next.dedicated && (!active || current.name == next.name)) return true;
         if (gui->getCore()->state() != Core::Stopped) {
             QMessageBox::information(gui, tr("Playback Screen"), tr("Stop playback before changing the playback display. The previous selection remains active."));
@@ -276,6 +569,7 @@ private:
         return true;
     }
     void release() {
+        redirectingBridge = false;
         stopBridges();
         stereo.restoreDisplayMode();
         if (viewport && video && originalParent && viewport->isAttached())
@@ -314,13 +608,20 @@ private:
     QPointer<PlaybackViewport> viewport;
     QMap<PreferencesDialog *, PrefPlaybackScreen *> editors;
     QMap<QAction *, bool> disabled;
+    QSet<TimeSlider *> hookedSliders;
+#ifdef SKINS
+    QSet<MediaPanel *> hookedMediaPanels;
+#endif
     PlaybackScreenChoice current;
     MvHevcBridge mvhevc;
-    MvcBlurayBridge mvcBluray;
+    MvcBlurayBridge mvc;
     Stereo3DController stereo;
     int savedForceFullscreen = -1;
     bool active = false;
     bool pendingDetach = false;
+    bool pendingReattach = false;
     bool redirectingBridge = false;
+    quint64 bridgeRedirectGen = 0;
+    double lastBridgeSec = 0.0;
 };
 #endif
