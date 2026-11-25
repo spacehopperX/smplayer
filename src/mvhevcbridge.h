@@ -157,11 +157,8 @@ public:
              << "-map" << "0:a:0?"
              << "-c:v" << "rawvideo"
              << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "pcm_s16le";
-        if (startSec > 0.0) {
-            args << "-output_ts_offset" << QString::number(startSec, 'f', 3);
-        }
-        args << "-f" << "nut"
+             << "-c:a" << "pcm_s16le"
+             << "-f" << "nut"
              << listenUrl;
 
         intentionalStop = false;

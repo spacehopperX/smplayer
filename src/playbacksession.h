@@ -181,8 +181,8 @@ private:
         if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
         const double dur = mvhevc.durationSec();
         if (dur <= 0.0) return;
-        if (currentSec >= 0.0) lastMvHevcSec = currentSec;
-        const double displaySec = (currentSec >= 0.0) ? currentSec : lastMvHevcSec;
+        if (currentSec >= 0.0) lastMvHevcSec = qBound(0.0, currentSec, dur);
+        const double displaySec = (currentSec >= 0.0) ? lastMvHevcSec : lastMvHevcSec;
         gui->getCore()->mdat.duration = dur;
 
         for (TimeSlider *slider : hookedSliders) {
@@ -425,13 +425,24 @@ private:
                                        mvhevc.isActive(), mvhevc.summary());
         });
         QObject::connect(gui->getCore(), &Core::showTime, this, [this](double sec) {
-            if (mvhevc.isActive()) syncMvHevcTimeline(sec);
+            if (mvhevc.isActive()) {
+                syncMvHevcTimeline(mvhevc.seekOffsetSec() + sec);
+            }
         });
         QObject::connect(gui->getCore(), &Core::newDuration, this, [this](double) {
             if (mvhevc.isActive()) {
                 QTimer::singleShot(0, this, [this]() { syncMvHevcTimeline(); });
             }
         });
+#ifdef SEEKBAR_RESOLUTION
+        QObject::connect(gui->getCore(), &Core::positionChanged, this, [this](int) {
+            if (mvhevc.isActive()) syncMvHevcTimeline();
+        });
+#else
+        QObject::connect(gui->getCore(), &Core::posChanged, this, [this](int) {
+            if (mvhevc.isActive()) syncMvHevcTimeline();
+        });
+#endif
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (viewport) {
                 viewport->hide();
