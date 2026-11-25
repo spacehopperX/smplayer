@@ -6,6 +6,7 @@
 #include "mvhevcbridge.h"
 #include "stereo3dshaders.h"
 #include "basegui.h"
+#include "mplayerwindow.h"
 #include "global.h"
 #include "preferences.h"
 #include "paths.h"
@@ -218,6 +219,7 @@ public:
     }
 
     const Stereo3DSettings &settings() const { return cfg; }
+    bool isFramePackedActive() const { return framePackedActive; }
     void setBridgeNote(const QString &note) { lastBridgeNote = note; }
 
     void ensureGpuNextIfConfigured() {
@@ -328,6 +330,8 @@ public:
             }
         }
 
+        framePackedActive = needFramePackingMode;
+
         lastModeError.clear();
         if (needFramePackingMode && cfg.autoSwitchDisplayMode && !playbackScreenName.isEmpty()) {
             const bool switchedBefore = modeSwitcher.isSwitched();
@@ -339,13 +343,16 @@ public:
             if (onDisplayModeChanged) onDisplayModeChanged();
         }
 
+        syncVideoWindowAspect(gui, needFramePackingMode);
         applyShaderToProcess(core->playerProcess(), shader, needFramePackingMode);
     }
 
     void onPlaybackStopped(BaseGui *gui, const std::function<void()> &onDisplayModeChanged) {
+        framePackedActive = false;
         if (gui && gui->getCore()) {
             applyShaderToProcess(gui->getCore()->playerProcess(), Stereo3DShaders::None, false);
         }
+        syncVideoWindowAspect(gui, false);
         if (cfg.restoreModeOnStop && modeSwitcher.isSwitched()) {
             modeSwitcher.restore();
             if (onDisplayModeChanged) onDisplayModeChanged();
@@ -353,6 +360,7 @@ public:
     }
 
     void restoreDisplayMode(const std::function<void()> &onDisplayModeChanged = nullptr) {
+        framePackedActive = false;
         if (modeSwitcher.isSwitched()) {
             modeSwitcher.restore();
             if (onDisplayModeChanged) onDisplayModeChanged();
@@ -389,6 +397,20 @@ public:
     }
 
 private:
+    void syncVideoWindowAspect(BaseGui *gui, bool framePacked) {
+        if (!gui) return;
+        MplayerWindow *mw = gui->findChild<MplayerWindow *>("mplayerwindow");
+        if (!mw) return;
+        if (framePacked) {
+            mw->setAspect(0);
+            if (QWidget *vl = mw->videoLayer()) {
+                if (vl->geometry() != mw->rect()) vl->setGeometry(mw->rect());
+            }
+        } else if (gui->getCore() && gui->getCore()->mdat.video_aspect > 0) {
+            mw->setAspect(gui->getCore()->mdat.video_aspect);
+        }
+    }
+
     void applyShaderToProcess(PlayerProcess *process, Stereo3DShaders::ShaderKind kind, bool framePacked) {
         activeShaderPath = Stereo3DShaders::ensureShader(kind);
         if (!process || !process->isMPV() || !process->isRunning()) return;
@@ -423,6 +445,7 @@ private:
     QString activeShaderPath;
     QString lastModeError;
     QString lastBridgeNote;
+    bool framePackedActive = false;
 };
 
 #endif
