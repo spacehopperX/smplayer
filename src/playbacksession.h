@@ -181,8 +181,14 @@ private:
         if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
         const double dur = mvhevc.durationSec();
         if (dur <= 0.0) return;
-        if (currentSec >= 0.0) lastMvHevcSec = qBound(0.0, currentSec, dur);
-        const double displaySec = (currentSec >= 0.0) ? lastMvHevcSec : lastMvHevcSec;
+        if (currentSec >= 0.0) {
+            double clamped = qBound(0.0, currentSec, dur);
+            if (clamped < lastMvHevcSec && (lastMvHevcSec - clamped) < 1.5) {
+                clamped = lastMvHevcSec;
+            }
+            lastMvHevcSec = clamped;
+        }
+        const double displaySec = lastMvHevcSec;
         gui->getCore()->mdat.duration = dur;
 
         for (TimeSlider *slider : hookedSliders) {
@@ -430,9 +436,7 @@ private:
             }
         });
         QObject::connect(gui->getCore(), &Core::newDuration, this, [this](double) {
-            if (mvhevc.isActive()) {
-                QTimer::singleShot(0, this, [this]() { syncMvHevcTimeline(); });
-            }
+            if (mvhevc.isActive()) syncMvHevcTimeline();
         });
 #ifdef SEEKBAR_RESOLUTION
         QObject::connect(gui->getCore(), &Core::positionChanged, this, [this](int) {
