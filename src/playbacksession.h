@@ -16,6 +16,9 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QTimer>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 // Header-only integration uses typed Qt connections and needs no new moc target.
 class PlaybackSession : public QObject {
@@ -84,7 +87,10 @@ protected:
                 if (object->objectName() == "mplayerwindowlogo") {
                     if (auto *widget = qobject_cast<QWidget *>(object)) {
                         widget->hide();
-                        QTimer::singleShot(0, widget, &QWidget::hide);
+                        widget->lower();
+                        QTimer::singleShot(0, this, [this]() {
+                            if (active) hideLogo();
+                        });
                     }
                 }
                 if (auto *controls = qobject_cast<AutohideWidget *>(object)) {
@@ -100,7 +106,25 @@ private:
         video->setLogoVisible(false);
         if (auto *logo = video->findChild<QWidget *>("mplayerwindowlogo")) {
             logo->hide();
+            logo->lower();
         }
+        if (QWidget *vl = video->videoLayer()) {
+            vl->raise();
+#ifdef Q_OS_WIN
+            if (vl->testAttribute(Qt::WA_WState_Created)) {
+                SetWindowRgn(reinterpret_cast<HWND>(vl->winId()), nullptr, TRUE);
+            }
+#endif
+        }
+    }
+    void scheduleLogoClear() {
+        hideLogo();
+        QTimer::singleShot(0, this, [this]() {
+            if (gui && gui->getCore()->state() != Core::Stopped) hideLogo();
+        });
+        QTimer::singleShot(100, this, [this]() {
+            if (gui && gui->getCore()->state() != Core::Stopped) hideLogo();
+        });
     }
     void bindGui(BaseGui *window) {
         if (!window) return;
@@ -129,22 +153,22 @@ private:
                 });
             } else if (active && viewport) {
                 if (state != Core::Stopped) {
-                    hideLogo();
                     viewport->setVideoVisible(true);
-                    QTimer::singleShot(0, this, [this]() {
-                        if (active && gui && gui->getCore()->state() != Core::Stopped) hideLogo();
-                    });
+                    scheduleLogoClear();
                 } else {
                     viewport->setVideoVisible(false);
                 }
                 if (state == Core::Playing || state == Core::Paused) quietBackend();
             } else if (state == Core::Playing || state == Core::Paused) {
-                hideLogo();
+                scheduleLogoClear();
             }
         });
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
-            hideLogo();
+            scheduleLogoClear();
             if (active) quietBackend();
+        });
+        QObject::connect(gui->getCore(), &Core::mediaLoaded, this, [this]() {
+            scheduleLogoClear();
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (viewport) {
