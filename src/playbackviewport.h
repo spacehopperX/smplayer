@@ -8,13 +8,15 @@
 #include <QPalette>
 #include <QPointer>
 #include <QScreen>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
 
 class PlaybackViewport : public QWidget {
 public:
     explicit PlaybackViewport(QWidget *owner = nullptr)
-        : QWidget(owner, Qt::Window | Qt::FramelessWindowHint) {
+        : QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint) {
+        Q_UNUSED(owner);
         setObjectName("playback_viewport");
         setWindowTitle(tr("SMPlayer Playback"));
         setAutoFillBackground(true);
@@ -44,17 +46,31 @@ public:
             if (target) QObject::disconnect(target.data(), nullptr, this, nullptr);
             target = screen;
             QObject::connect(screen, &QScreen::geometryChanged, this,
-                [this](const QRect &) { if (target) applyScreen(target); });
+                [this](const QRect &) { if (target && isVisible()) applyScreen(target); });
         }
+        setWindowState(Qt::WindowNoState);
         winId();
         if (windowHandle()) windowHandle()->setScreen(screen);
-        setGeometry(screen->geometry());
-        showFullScreen();
+        const QRect geom = screen->geometry();
+        setGeometry(geom);
+        show();
+        setGeometry(geom);
+        QTimer::singleShot(0, this, [this]() {
+            if (!target || !isVisible()) return;
+            if (windowHandle() && windowHandle()->screen() != target)
+                windowHandle()->setScreen(target);
+            const QRect g = target->geometry();
+            if (geometry() != g) setGeometry(g);
+        });
     }
     void setVideoVisible(bool visible) {
         if (attached) attached->setVisible(visible);
     }
     void detachVideo(MplayerWindow *video, QWidget *parent) {
+        if (target) QObject::disconnect(target.data(), nullptr, this, nullptr);
+        target.clear();
+        setWindowState(Qt::WindowNoState);
+        hide();
         if (attached == video && video && parent) {
             root->removeWidget(video);
             video->setParent(parent);
@@ -62,9 +78,6 @@ public:
             attached.clear();
             video->show();
         }
-        if (target) QObject::disconnect(target.data(), nullptr, this, nullptr);
-        target.clear();
-        hide();
     }
     bool isAttached() const { return !attached.isNull(); }
     QString currentScreenName() const { return target ? target->name() : QString(); }
