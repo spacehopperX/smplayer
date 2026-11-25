@@ -30,6 +30,18 @@ public:
             if (gui->getCore()->state() == Core::Stopped)
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
         });
+        QObject::connect(qApp, &QGuiApplication::screenAdded, this, [this](QScreen *screen) {
+            if (!screen || active || !gui) return;
+            if (!current.dedicated || current.name.isEmpty() || screen->name() != current.name) return;
+            if (gui->getCore()->state() == Core::Stopped) {
+                QTimer::singleShot(300, this, [this]() {
+                    if (!active && current.dedicated && PlaybackViewport::findScreenByName(current.name))
+                        apply(current);
+                });
+            } else {
+                pendingReattach = true;
+            }
+        });
         QObject::connect(qApp, &QCoreApplication::aboutToQuit, this, [this]() {
             if (viewport) viewport->hide();
         });
@@ -37,8 +49,11 @@ public:
     }
     ~PlaybackSession() override {
         qApp->removeEventFilter(this);
-        if (viewport) viewport->hide();
-        // The GUI owns the viewport. Core is destroyed before its video widget.
+        if (viewport) {
+            viewport->hide();
+            delete viewport;
+            viewport.clear();
+        }
     }
     void initialize() {
         current = PlaybackScreenChoice::load();
@@ -67,7 +82,10 @@ protected:
             }
             if (active && video) {
                 if (object->objectName() == "mplayerwindowlogo") {
-                    if (auto *widget = qobject_cast<QWidget *>(object)) widget->hide();
+                    if (auto *widget = qobject_cast<QWidget *>(object)) {
+                        widget->hide();
+                        QTimer::singleShot(0, widget, &QWidget::hide);
+                    }
                 }
                 if (auto *controls = qobject_cast<AutohideWidget *>(object)) {
                     if (video->isAncestorOf(controls)) controls->deactivate();
@@ -77,29 +95,63 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    void hideLogo() {
+        if (!video) return;
+        video->setLogoVisible(false);
+        if (auto *logo = video->findChild<QWidget *>("mplayerwindowlogo")) {
+            logo->hide();
+        }
+    }
     void bindGui(BaseGui *window) {
         if (!window) return;
         gui = window;
         video = gui->findChild<MplayerWindow *>("mplayerwindow");
         originalParent = video ? video->parentWidget() : nullptr;
+        if (viewport) {
+            viewport->hide();
+            viewport->deleteLater();
+        }
         viewport = new PlaybackViewport(gui);
         disabled.clear();
         active = false;
         pendingDetach = false;
+        pendingReattach = false;
         savedForceFullscreen = gui->forceStartInFullscreen();
 
         QObject::connect(gui->getCore(), &Core::stateChanged, this, [this](Core::State state) {
             if (pendingDetach && state == Core::Stopped) {
                 QTimer::singleShot(0, this, [this]() { release(); pendingDetach = false; });
+            } else if (pendingReattach && !active && state == Core::Stopped) {
+                pendingReattach = false;
+                QTimer::singleShot(200, this, [this]() {
+                    if (!active && current.dedicated && PlaybackViewport::findScreenByName(current.name))
+                        apply(current);
+                });
             } else if (active && viewport) {
-                viewport->setVideoVisible(state != Core::Stopped);
+                if (state != Core::Stopped) {
+                    hideLogo();
+                    viewport->setVideoVisible(true);
+                    QTimer::singleShot(0, this, [this]() {
+                        if (active && gui && gui->getCore()->state() != Core::Stopped) hideLogo();
+                    });
+                } else {
+                    viewport->setVideoVisible(false);
+                }
                 if (state == Core::Playing || state == Core::Paused) quietBackend();
+            } else if (state == Core::Playing || state == Core::Paused) {
+                hideLogo();
             }
         });
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
+            hideLogo();
             if (active) quietBackend();
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
+            if (viewport) {
+                viewport->hide();
+                viewport->deleteLater();
+                viewport.clear();
+            }
             if (QCoreApplication::closingDown() || !app) return;
             QTimer::singleShot(0, this, [this]() {
                 if (QCoreApplication::closingDown() || !app) return;
@@ -131,6 +183,7 @@ private:
     }
     bool apply(const PlaybackScreenChoice &next) {
         if (!gui || !video || !viewport) return false;
+        pendingReattach = false;
         if (active == next.dedicated && (!active || current.name == next.name)) return true;
         if (gui->getCore()->state() != Core::Stopped) {
             QMessageBox::information(gui, tr("Playback Screen"), tr("Stop playback before changing the playback display. The previous selection remains active."));
@@ -215,5 +268,6 @@ private:
     int savedForceFullscreen = -1;
     bool active = false;
     bool pendingDetach = false;
+    bool pendingReattach = false;
 };
 #endif
