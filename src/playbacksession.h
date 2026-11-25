@@ -11,6 +11,7 @@
 #include "stereo3dcontroller.h"
 #include "autohidewidget.h"
 #include "playerprocess.h"
+#include "timeslider.h"
 #include <QAction>
 #include <QApplication>
 #include <QEvent>
@@ -18,6 +19,7 @@
 #include <QMap>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QSet>
 #include <QTimer>
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -92,6 +94,9 @@ protected:
             }
         }
         if (event->type() == QEvent::Show) {
+            if (auto *slider = qobject_cast<TimeSlider *>(object)) {
+                hookTimeSlider(slider);
+            }
             if (auto *dialog = qobject_cast<PreferencesDialog *>(object)) {
                 if (!editors.contains(dialog)) {
                     auto *page = new PrefPlaybackScreen(dialog);
@@ -125,6 +130,80 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    void hookTimeSlider(TimeSlider *slider) {
+        if (!slider || hookedSliders.contains(slider)) return;
+        hookedSliders.insert(slider);
+        QObject::connect(slider, &QObject::destroyed, this, [this, slider]() {
+            hookedSliders.remove(slider);
+        });
+        QObject::connect(slider, &TimeSlider::posChanged, this, [this, slider](int pos) {
+            if (!mvhevc.isActive() || redirectingMvHevc) return;
+            const double dur = mvhevc.durationSec();
+            if (dur <= 0.0) return;
+            const int maxVal = qMax(1, slider->maximum());
+            const double targetSec = (static_cast<double>(pos) / static_cast<double>(maxVal)) * dur;
+            seekMvHevcTo(targetSec);
+        });
+    }
+    void syncMvHevcTimeline(double currentSec = -1.0) {
+        if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
+        const double dur = mvhevc.durationSec();
+        if (dur <= 0.0) return;
+        gui->getCore()->mdat.duration = dur;
+        for (TimeSlider *slider : hookedSliders) {
+            if (!slider) continue;
+            slider->setDuration(dur);
+            if (currentSec >= 0.0) {
+                const int maxVal = qMax(1, slider->maximum());
+                const int pos = qBound(0, qRound((currentSec / dur) * maxVal), maxVal);
+                slider->setPos(pos);
+            }
+        }
+    }
+    void configureMvHevcMpvCache() {
+        if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
+        if (auto *process = gui->getCore()->playerProcess()) {
+            if (process->isMPV() && process->isRunning()) {
+                process->sendCommand("no-osd set demuxer-max-bytes 768MiB");
+                process->sendCommand("no-osd set demuxer-max-back-bytes 128MiB");
+                process->sendCommand("no-osd set demuxer-readahead-secs 4");
+                process->sendCommand("no-osd set cache-pause no");
+            }
+        }
+    }
+    void seekMvHevcTo(double targetSec) {
+        if (!gui || !gui->getCore() || !mvhevc.isActive() || redirectingMvHevc) return;
+        const QString source = mvhevc.sourceFile();
+        const MvHevcProbe info = mvhevc.probeInfo();
+        if (source.isEmpty()) return;
+
+        const double clamped = qBound(0.0, targetSec, qMax(0.0, info.durationSec - 1.0));
+        QString err;
+        if (!mvhevc.start(source, info, stereo.settings().ffmpegPath, &err,
+                          [this](const QString &note) { stereo.setBridgeNote(note); },
+                          clamped)) {
+            stereo.setBridgeNote(err);
+            return;
+        }
+
+        redirectingMvHevc = true;
+        const quint64 gen = ++mvHevcRedirectGen;
+        const QString streamUrl = mvhevc.url();
+        const QString title = QFileInfo(source).fileName() + QStringLiteral(" [MV-HEVC 3D]");
+
+        gui->getCore()->stop();
+        QTimer::singleShot(250, this, [this, gen, streamUrl, title]() {
+            if (!gui || !gui->getCore() || mvHevcRedirectGen != gen || !mvhevc.isActiveUrl(streamUrl)) {
+                if (mvHevcRedirectGen == gen) redirectingMvHevc = false;
+                return;
+            }
+            gui->getCore()->addForcedTitle(streamUrl, title);
+            gui->getCore()->openStream(streamUrl);
+        });
+        QTimer::singleShot(6000, this, [this, gen]() {
+            if (mvHevcRedirectGen == gen) redirectingMvHevc = false;
+        });
+    }
     void hideLogo() {
         if (!video) return;
         video->setLogoVisible(false);
@@ -174,6 +253,10 @@ private:
         gui = window;
         video = gui->findChild<MplayerWindow *>("mplayerwindow");
         originalParent = video ? video->parentWidget() : nullptr;
+        hookedSliders.clear();
+        for (TimeSlider *slider : gui->findChildren<TimeSlider *>()) {
+            hookTimeSlider(slider);
+        }
         if (viewport) {
             viewport->hide();
             viewport->deleteLater();
@@ -211,8 +294,13 @@ private:
             const QString streamUrl = mvhevc.url();
             const QString title = QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]");
 
+            if (active && viewport) viewport->setVideoVisible(false);
             gui->getCore()->stop();
-            QTimer::singleShot(250, this, [this, gen, streamUrl, title]() {
+            const bool switchedDisplay = stereo.prepareFramePackingDisplay(
+                gui, activeScreenName(), [this]() { reapplyViewportGeometry(); });
+            const int openDelayMs = switchedDisplay ? 650 : 250;
+
+            QTimer::singleShot(openDelayMs, this, [this, gen, streamUrl, title]() {
                 if (!gui || !gui->getCore() || mvHevcRedirectGen != gen || !mvhevc.isActiveUrl(streamUrl)) {
                     if (mvHevcRedirectGen == gen) redirectingMvHevc = false;
                     return;
@@ -242,8 +330,10 @@ private:
                     }
                 }
             } else if (active && viewport) {
-                viewport->setVideoVisible(true);
-                scheduleLogoClear();
+                if (!redirectingMvHevc) {
+                    viewport->setVideoVisible(true);
+                    scheduleLogoClear();
+                }
                 if (state == Core::Playing || state == Core::Paused) quietBackend();
             } else if (state == Core::Playing || state == Core::Paused) {
                 scheduleLogoClear();
@@ -254,8 +344,11 @@ private:
                 mvhevc.isActiveUrl(gui->getCore()->mdat.filename)) {
                 redirectingMvHevc = false;
             }
+            if (active && viewport) viewport->setVideoVisible(true);
             scheduleLogoClear();
             if (active) quietBackend();
+            configureMvHevcMpvCache();
+            syncMvHevcTimeline();
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
         });
@@ -264,9 +357,18 @@ private:
                 mvhevc.isActiveUrl(gui->getCore()->mdat.filename)) {
                 redirectingMvHevc = false;
             }
+            if (active && viewport) viewport->setVideoVisible(true);
             scheduleLogoClear();
+            configureMvHevcMpvCache();
+            syncMvHevcTimeline();
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
+        });
+        QObject::connect(gui->getCore(), &Core::showTime, this, [this](double sec) {
+            if (mvhevc.isActive()) syncMvHevcTimeline(sec);
+        });
+        QObject::connect(gui->getCore(), &Core::newDuration, this, [this](double) {
+            if (mvhevc.isActive()) syncMvHevcTimeline();
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (viewport) {
@@ -397,6 +499,7 @@ private:
     QPointer<PlaybackViewport> viewport;
     QMap<PreferencesDialog *, PrefPlaybackScreen *> editors;
     QMap<QAction *, bool> disabled;
+    QSet<TimeSlider *> hookedSliders;
     PlaybackScreenChoice current;
     MvHevcBridge mvhevc;
     Stereo3DController stereo;

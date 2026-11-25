@@ -230,6 +230,28 @@ public:
         }
     }
 
+    bool prepareFramePackingDisplay(BaseGui *gui,
+                                    const QString &playbackScreenName,
+                                    const std::function<void()> &onDisplayModeChanged) {
+        if (!cfg.autoSwitchDisplayMode || playbackScreenName.isEmpty()) return false;
+        if (cfg.outputMode != Stereo3DSettings::OutputAutoFramePacked &&
+            cfg.outputMode != Stereo3DSettings::OutputFramePacked) {
+            return false;
+        }
+        framePackedActive = true;
+        if (modeSwitcher.isSwitched()) {
+            syncVideoWindowAspect(gui, true);
+            return false;
+        }
+        lastModeError.clear();
+        if (modeSwitcher.switchToFramePacking(playbackScreenName, cfg.preferred3DRefreshHz, &lastModeError)) {
+            syncVideoWindowAspect(gui, true);
+            if (onDisplayModeChanged) onDisplayModeChanged();
+            return true;
+        }
+        return false;
+    }
+
     static Stereo3DDetection detectInput(const QString &filename, int width, int height) {
         Stereo3DDetection det;
         const QString base = QFileInfo(filename).completeBaseName();

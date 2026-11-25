@@ -20,6 +20,7 @@ struct MvHevcProbe {
     bool isMvHevc = false;
     int leftView = 1;
     int rightView = 0;
+    double durationSec = 0.0;
     QString summary;
 };
 
@@ -69,7 +70,7 @@ public:
             p.start(ffprobe, QStringList{
                 "-v", "error",
                 "-select_streams", "v:0",
-                "-show_entries", "stream_side_data=",
+                "-show_entries", "stream_side_data=:format=duration",
                 "-of", "default=nw=1",
                 filePath
             });
@@ -83,6 +84,10 @@ public:
                         viewIds = line.mid(QStringLiteral("view_ids_available=").size()).split(',', Qt::SkipEmptyParts);
                     } else if (line.startsWith("view_pos_available=")) {
                         viewPos = line.mid(QStringLiteral("view_pos_available=").size()).split(',', Qt::SkipEmptyParts);
+                    } else if (line.startsWith("duration=")) {
+                        bool ok = false;
+                        const double dur = line.mid(QStringLiteral("duration=").size()).trimmed().toDouble(&ok);
+                        if (ok && dur > 0.0) result.durationSec = dur;
                     }
                 }
                 if (viewIds.size() >= 2) {
@@ -116,7 +121,8 @@ public:
                const MvHevcProbe &info,
                const QString &configuredFfmpeg,
                QString *errorOut = nullptr,
-               std::function<void(const QString &)> onBridgeNote = nullptr) {
+               std::function<void(const QString &)> onBridgeNote = nullptr,
+               double startSec = 0.0) {
         stop();
         const QString ffmpeg = findExecutable(configuredFfmpeg, "ffmpeg");
         if (ffmpeg.isEmpty()) {
@@ -141,15 +147,21 @@ public:
         QStringList args;
         args << "-hide_banner"
              << "-loglevel" << "error"
-             << "-nostdin"
-             << "-i" << sourceFile
+             << "-nostdin";
+        if (startSec > 0.0) {
+            args << "-ss" << QString::number(startSec, 'f', 3);
+        }
+        args << "-i" << sourceFile
              << "-filter_complex" << filter
              << "-map" << "[v]"
              << "-map" << "0:a:0?"
              << "-c:v" << "rawvideo"
              << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "pcm_s16le"
-             << "-f" << "nut"
+             << "-c:a" << "pcm_s16le";
+        if (startSec > 0.0) {
+            args << "-output_ts_offset" << QString::number(startSec, 'f', 3);
+        }
+        args << "-f" << "nut"
              << listenUrl;
 
         intentionalStop = false;
@@ -193,6 +205,8 @@ public:
         activeUrl = QString("tcp://127.0.0.1:%1").arg(port);
         activeSource = sourceFile;
         activeSummary = info.summary;
+        activeProbe = info;
+        activeSeekOffsetSec = startSec;
         return true;
     }
 
@@ -211,6 +225,8 @@ public:
         activeUrl.clear();
         activeSource.clear();
         activeSummary.clear();
+        activeProbe = MvHevcProbe();
+        activeSeekOffsetSec = 0.0;
     }
 
     bool isActive() const { return !activeUrl.isEmpty(); }
@@ -218,6 +234,9 @@ public:
     QString url() const { return activeUrl; }
     QString sourceFile() const { return activeSource; }
     QString summary() const { return activeSummary; }
+    double durationSec() const { return activeProbe.durationSec; }
+    double seekOffsetSec() const { return activeSeekOffsetSec; }
+    const MvHevcProbe &probeInfo() const { return activeProbe; }
 
 private:
     static bool containsMvHevcAtoms(const QString &filePath) {
@@ -238,6 +257,8 @@ private:
     QString activeUrl;
     QString activeSource;
     QString activeSummary;
+    MvHevcProbe activeProbe;
+    double activeSeekOffsetSec = 0.0;
     QString stderrLog;
     std::function<void(const QString &)> noteCallback;
     bool intentionalStop = false;
