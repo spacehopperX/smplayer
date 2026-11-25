@@ -71,6 +71,22 @@ public:
     }
 protected:
     bool eventFilter(QObject *object, QEvent *event) override {
+        if (active && video && stereo.isFramePackedActive() &&
+            object == video->videoLayer() &&
+            (event->type() == QEvent::Move || event->type() == QEvent::Resize)) {
+            if (QWidget *vl = video->videoLayer()) {
+                if (vl->geometry() != video->rect()) {
+                    QTimer::singleShot(0, this, [this]() {
+                        if (active && video && stereo.isFramePackedActive()) {
+                            video->setAspect(0);
+                            if (QWidget *layer = video->videoLayer()) {
+                                if (layer->geometry() != video->rect()) layer->setGeometry(video->rect());
+                            }
+                        }
+                    });
+                }
+            }
+        }
         if (event->type() == QEvent::Show) {
             if (auto *dialog = qobject_cast<PreferencesDialog *>(object)) {
                 if (!editors.contains(dialog)) {
@@ -136,6 +152,12 @@ private:
             if (!active || !viewport) return;
             if (QScreen *screen = PlaybackViewport::findScreenByName(current.name)) {
                 viewport->applyScreen(screen);
+            }
+            if (video && stereo.isFramePackedActive()) {
+                video->setAspect(0);
+                if (QWidget *vl = video->videoLayer()) {
+                    if (vl->geometry() != video->rect()) vl->setGeometry(video->rect());
+                }
             }
             if (gui && gui->getCore()->state() != Core::Stopped) scheduleLogoClear();
         });
