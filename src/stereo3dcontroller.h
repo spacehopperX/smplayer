@@ -7,6 +7,7 @@
 #include "stereo3dshaders.h"
 #include "stereo3dsubtitles.h"
 #include "basegui.h"
+#include "mplayerwindow.h"
 #include "global.h"
 #include "preferences.h"
 #include "paths.h"
@@ -268,6 +269,7 @@ public:
     }
 
     const Stereo3DSettings &settings() const { return cfg; }
+    bool isFramePackedActive() const { return framePackedActive; }
     void setBridgeNote(const QString &note) { lastBridgeNote = note; }
 
     void ensureGpuNextIfConfigured() {
@@ -276,6 +278,28 @@ public:
         if (vo.isEmpty() || vo == "direct3d" || vo == "default") {
             Global::pref->vo = "gpu-next";
         }
+    }
+
+    bool prepareFramePackingDisplay(BaseGui *gui,
+                                    const QString &playbackScreenName,
+                                    const std::function<void()> &onDisplayModeChanged) {
+        if (!cfg.autoSwitchDisplayMode || playbackScreenName.isEmpty()) return false;
+        if (cfg.outputMode != Stereo3DSettings::OutputAutoFramePacked &&
+            cfg.outputMode != Stereo3DSettings::OutputFramePacked) {
+            return false;
+        }
+        framePackedActive = true;
+        if (modeSwitcher.isSwitched()) {
+            syncVideoWindowAspect(gui, true);
+            return false;
+        }
+        lastModeError.clear();
+        if (modeSwitcher.switchToFramePacking(playbackScreenName, cfg.preferred3DRefreshHz, &lastModeError)) {
+            syncVideoWindowAspect(gui, true);
+            if (onDisplayModeChanged) onDisplayModeChanged();
+            return true;
+        }
+        return false;
     }
 
     static Stereo3DDetection detectInput(const QString &filename, int width, int height) {
@@ -378,6 +402,8 @@ public:
             }
         }
 
+        framePackedActive = needFramePackingMode;
+
         lastModeError.clear();
         if (needFramePackingMode && cfg.autoSwitchDisplayMode && !playbackScreenName.isEmpty()) {
             const bool switchedBefore = modeSwitcher.isSwitched();
@@ -389,6 +415,7 @@ public:
             if (onDisplayModeChanged) onDisplayModeChanged();
         }
 
+        syncVideoWindowAspect(gui, needFramePackingMode);
         applyShaderToProcess(core->playerProcess(), shader, needFramePackingMode);
         stereoSubtitles.apply(
             core->playerProcess(),
@@ -400,12 +427,14 @@ public:
     }
 
     void onPlaybackStopped(BaseGui *gui, const std::function<void()> &onDisplayModeChanged) {
+        framePackedActive = false;
         if (gui && gui->getCore()) {
             applyShaderToProcess(gui->getCore()->playerProcess(), Stereo3DShaders::None, false);
             stereoSubtitles.apply(gui->getCore()->playerProcess(), false, cfg.subtitleDepthPx,
                                   cfg.subtitleFontSize, cfg.subtitleMarginY, cfg.swapEyes);
         }
         stereoSubtitles.reset();
+        syncVideoWindowAspect(gui, false);
         if (cfg.restoreModeOnStop && modeSwitcher.isSwitched()) {
             modeSwitcher.restore();
             if (onDisplayModeChanged) onDisplayModeChanged();
@@ -413,6 +442,7 @@ public:
     }
 
     void restoreDisplayMode(const std::function<void()> &onDisplayModeChanged = nullptr) {
+        framePackedActive = false;
         if (modeSwitcher.isSwitched()) {
             modeSwitcher.restore();
             if (onDisplayModeChanged) onDisplayModeChanged();
@@ -449,6 +479,20 @@ public:
     }
 
 private:
+    void syncVideoWindowAspect(BaseGui *gui, bool framePacked) {
+        if (!gui) return;
+        MplayerWindow *mw = gui->findChild<MplayerWindow *>("mplayerwindow");
+        if (!mw) return;
+        if (framePacked) {
+            mw->setAspect(0);
+            if (QWidget *vl = mw->videoLayer()) {
+                if (vl->geometry() != mw->rect()) vl->setGeometry(mw->rect());
+            }
+        } else if (gui->getCore() && gui->getCore()->mdat.video_aspect > 0) {
+            mw->setAspect(gui->getCore()->mdat.video_aspect);
+        }
+    }
+
     void applyShaderToProcess(PlayerProcess *process, Stereo3DShaders::ShaderKind kind, bool framePacked) {
         activeShaderPath = Stereo3DShaders::ensureShader(kind);
         if (!process || !process->isMPV() || !process->isRunning()) return;
@@ -487,6 +531,7 @@ private:
     QString activeShaderPath;
     QString lastModeError;
     QString lastBridgeNote;
+    bool framePackedActive = false;
 };
 
 #endif
