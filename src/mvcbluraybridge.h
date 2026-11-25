@@ -3,12 +3,15 @@
 #define MVCBLURAYBRIDGE_H
 
 #include "mvhevcbridge.h"
+#include "global.h"
+#include "preferences.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QHostAddress>
 #include <QObject>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
@@ -62,7 +65,56 @@ public:
         return QString();
     }
 
+    static QString resolveBlurayRoot(const QString &filePath) {
+        const QString trimmed = filePath.trimmed();
+        if (trimmed.isEmpty()) return QString();
+
+        // Handle SMPlayer/mpv Blu-ray URLs: br://..., bd://..., bluray://...
+        static const QRegularExpression reBlurayUrl(
+            QStringLiteral("^(?:br|bd|bluray)://(?:[0-9]*)/*(.*)$"),
+            QRegularExpression::CaseInsensitiveOption);
+        const QRegularExpressionMatch m = reBlurayUrl.match(trimmed);
+        if (m.hasMatch()) {
+            QString rest = m.captured(1).trimmed();
+            if (rest.isEmpty() && Global::pref && !Global::pref->bluray_device.trimmed().isEmpty()) {
+                rest = Global::pref->bluray_device.trimmed();
+            }
+            if (!rest.isEmpty()) {
+                if (rest.size() == 1 && rest[0].isLetter()) rest += ":/";
+                else if (rest.size() == 2 && rest[0].isLetter() && rest[1] == ':') rest += '/';
+                return QDir::fromNativeSeparators(rest);
+            }
+            return QString();
+        }
+
+        // Handle mounted Blu-ray drive or folder directly (e.g. E:/, E:\BDMV, etc.)
+        const QFileInfo fi(trimmed);
+        if (fi.exists() && fi.isDir()) {
+            return QDir::fromNativeSeparators(fi.absoluteFilePath());
+        }
+        return QString();
+    }
+
+    static QString findSsifDirFromRoot(const QString &rootPath) {
+        if (rootPath.isEmpty()) return QString();
+        const QString clean = QDir::cleanPath(rootPath);
+        const QStringList candidates = {
+            clean + "/BDMV/STREAM/SSIF",
+            clean + "/STREAM/SSIF",
+            clean + "/SSIF",
+            clean
+        };
+        for (const QString &cand : candidates) {
+            QDir d(cand);
+            if (d.exists() && !d.entryList(QStringList{"*.ssif", "*.SSIF"}, QDir::Files).isEmpty()) {
+                return d.absolutePath();
+            }
+        }
+        return QString();
+    }
+
     static bool isCandidateFile(const QString &filePath) {
+        if (!resolveBlurayRoot(filePath).isEmpty()) return true;
         const QFileInfo fi(filePath);
         if (!fi.exists() || !fi.isFile()) return false;
         const QString ext = fi.suffix().toLower();
@@ -73,33 +125,49 @@ public:
         MvcBlurayProbe res;
         if (!isCandidateFile(filePath)) return res;
 
-        const QFileInfo fi(filePath);
-        const QString ext = fi.suffix().toLower();
-        QString targetMedia = fi.absoluteFilePath();
+        QString targetMedia;
+        QString ext;
 
-        if (ext == "iso") {
-#ifdef Q_OS_WIN
-            const QString driveLetter = mountIso(fi.absoluteFilePath());
-            if (driveLetter.isEmpty()) return res;
-            const QString largestSsif = findLargestSsif(driveLetter + ":/BDMV/STREAM/SSIF");
-            if (largestSsif.isEmpty()) {
-                dismountIso(fi.absoluteFilePath());
-                return res;
-            }
+        const QString bdRoot = resolveBlurayRoot(filePath);
+        if (!bdRoot.isEmpty()) {
+            const QString ssifDir = findSsifDirFromRoot(bdRoot);
+            if (ssifDir.isEmpty()) return res;
+            const QString largestSsif = findLargestSsif(ssifDir);
+            if (largestSsif.isEmpty()) return res;
             res.isMvc = true;
-            res.mountedIsoPath = fi.absoluteFilePath();
             res.mediaPath = largestSsif;
             targetMedia = largestSsif;
-            res.summary = QString("Blu-ray 3D ISO (%1 -> Full-TAB)").arg(QFileInfo(largestSsif).fileName());
-#else
-            return res;
-#endif
-        } else if (ext == "ssif") {
-            res.isMvc = true;
-            res.mediaPath = targetMedia;
-            res.summary = QStringLiteral("Blu-ray 3D SSIF (H.264 MVC -> Full-TAB)");
+            ext = QStringLiteral("ssif");
+            res.summary = QString("Blu-ray 3D Disc (%1 -> Full-TAB)").arg(QFileInfo(largestSsif).fileName());
         } else {
-            res.mediaPath = targetMedia;
+            const QFileInfo fi(filePath);
+            ext = fi.suffix().toLower();
+            targetMedia = fi.absoluteFilePath();
+
+            if (ext == "iso") {
+#ifdef Q_OS_WIN
+                const QString driveLetter = mountIso(fi.absoluteFilePath());
+                if (driveLetter.isEmpty()) return res;
+                const QString largestSsif = findLargestSsif(driveLetter + ":/BDMV/STREAM/SSIF");
+                if (largestSsif.isEmpty()) {
+                    dismountIso(fi.absoluteFilePath());
+                    return res;
+                }
+                res.isMvc = true;
+                res.mountedIsoPath = fi.absoluteFilePath();
+                res.mediaPath = largestSsif;
+                targetMedia = largestSsif;
+                res.summary = QString("Blu-ray 3D ISO (%1 -> Full-TAB)").arg(QFileInfo(largestSsif).fileName());
+#else
+                return res;
+#endif
+            } else if (ext == "ssif") {
+                res.isMvc = true;
+                res.mediaPath = targetMedia;
+                res.summary = QStringLiteral("Blu-ray 3D SSIF (H.264 MVC -> Full-TAB)");
+            } else {
+                res.mediaPath = targetMedia;
+            }
         }
 
         const QString ffprobe = MvHevcBridge::findExecutable(configuredFfmpeg, "ffprobe");
