@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
 #include <QMutex>
@@ -75,7 +76,12 @@ public:
     void push(const QByteArray &data) {
         if (data.isEmpty() || stopping.loadRelaxed()) return;
         QMutexLocker lk(&mtx);
+        while (!stopping.loadRelaxed() && queueBytes > 16 * 1024 * 1024) {
+            spaceCv.wait(&mtx, 50);
+        }
+        if (stopping.loadRelaxed()) return;
         queue.enqueue(data);
+        queueBytes += data.size();
         cv.wakeOne();
     }
 
@@ -88,6 +94,7 @@ public:
         stopping.storeRelaxed(1);
         eof.storeRelaxed(1);
         cv.wakeAll();
+        spaceCv.wakeAll();
         if (handle != INVALID_HANDLE_VALUE) {
             const std::wstring wname = pipeName.toStdWString();
             HANDLE dummy = CreateFileW(wname.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -103,6 +110,7 @@ public:
         }
         QMutexLocker lk(&mtx);
         queue.clear();
+        queueBytes = 0;
     }
 
 protected:
@@ -123,6 +131,8 @@ protected:
                     continue;
                 }
                 chunk = queue.dequeue();
+                queueBytes -= chunk.size();
+                spaceCv.wakeOne();
             }
             const char *ptr = chunk.constData();
             int remaining = chunk.size();
@@ -130,6 +140,7 @@ protected:
                 DWORD written = 0;
                 if (!WriteFile(handle, ptr, static_cast<DWORD>(remaining), &written, nullptr) || written == 0) {
                     stopping.storeRelaxed(1);
+                    spaceCv.wakeAll();
                     break;
                 }
                 ptr += written;
@@ -144,9 +155,114 @@ private:
     HANDLE handle = INVALID_HANDLE_VALUE;
     QMutex mtx;
     QWaitCondition cv;
+    QWaitCondition spaceCv;
     QQueue<QByteArray> queue;
+    qint64 queueBytes = 0;
     QAtomicInt stopping{0};
     QAtomicInt eof{0};
+};
+
+// Direct Blu-ray 3D BDAV (192-byte MPEG-TS) demuxer for PID 0x1011 (AVC base) + PID 0x1012 (MVC dependent).
+class SsifDemuxThread : public QThread {
+public:
+    SsifDemuxThread(const QString &path,
+                    WinNamedPipeFeeder *base,
+                    WinNamedPipeFeeder *dep,
+                    double startSec,
+                    double durationSec)
+        : filePath(path), baseOut(base), depOut(dep), seekSec(startSec), totalSec(durationSec) {}
+
+    ~SsifDemuxThread() override { stopDemux(); }
+
+    void stopDemux() {
+        stopping.storeRelaxed(1);
+        if (isRunning()) wait(2000);
+    }
+
+protected:
+    void run() override {
+        QFile f(filePath);
+        if (!f.open(QIODevice::ReadOnly)) {
+            if (baseOut) baseOut->finishInput();
+            if (depOut) depOut->finishInput();
+            return;
+        }
+
+        if (seekSec > 0.0 && totalSec > 0.0) {
+            const qint64 sz = f.size();
+            qint64 pos = static_cast<qint64>((seekSec / totalSec) * static_cast<double>(sz));
+            pos = qBound<qint64>(0, pos - (pos % 192), qMax<qint64>(0, sz - 192));
+            f.seek(pos);
+        }
+
+        constexpr int kPacketSize = 192;
+        constexpr int kBatchPackets = 1024;
+        QByteArray readBuf(kPacketSize * kBatchPackets, Qt::Uninitialized);
+        QByteArray baseBuf;
+        QByteArray depBuf;
+        baseBuf.reserve(256 * 1024);
+        depBuf.reserve(256 * 1024);
+
+        while (!stopping.loadRelaxed()) {
+            const qint64 n = f.read(readBuf.data(), readBuf.size());
+            if (n <= 0) break;
+
+            const uchar *raw = reinterpret_cast<const uchar *>(readBuf.constData());
+            qint64 i = 0;
+            while (i + kPacketSize <= n && !stopping.loadRelaxed()) {
+                if (raw[i + 4] != 0x47) {
+                    ++i;
+                    continue;
+                }
+                const uchar *ts = raw + i + 4;
+                const bool pusi = (ts[1] & 0x40) != 0;
+                const quint16 pid = static_cast<quint16>(((ts[1] & 0x1F) << 8) | ts[2]);
+                const uchar afc = (ts[3] >> 4) & 0x03;
+
+                if ((pid == 0x1011 || pid == 0x1012) && (afc & 0x01)) {
+                    int off = 4;
+                    if (afc & 0x02) {
+                        off += 1 + ts[4];
+                    }
+                    if (off < 188) {
+                        if (pusi && off + 9 <= 188 &&
+                            ts[off] == 0x00 && ts[off + 1] == 0x00 && ts[off + 2] == 0x01) {
+                            off += 9 + ts[off + 8];
+                        }
+                        if (off < 188) {
+                            const char *payload = reinterpret_cast<const char *>(ts + off);
+                            const int len = 188 - off;
+                            if (pid == 0x1011) baseBuf.append(payload, len);
+                            else depBuf.append(payload, len);
+                        }
+                    }
+                }
+                i += kPacketSize;
+            }
+
+            if (baseBuf.size() >= 128 * 1024 && baseOut) {
+                baseOut->push(baseBuf);
+                baseBuf.clear();
+            }
+            if (depBuf.size() >= 128 * 1024 && depOut) {
+                depOut->push(depBuf);
+                depBuf.clear();
+            }
+        }
+
+        if (!baseBuf.isEmpty() && baseOut) baseOut->push(baseBuf);
+        if (!depBuf.isEmpty() && depOut) depOut->push(depBuf);
+        if (baseOut) baseOut->finishInput();
+        if (depOut) depOut->finishInput();
+    }
+
+private:
+    QString filePath;
+    WinNamedPipeFeeder *baseOut = nullptr;
+    WinNamedPipeFeeder *depOut = nullptr;
+    double seekSec = 0.0;
+    double totalSec = 0.0;
+    QAtomicInt stopping{0};
 };
 #endif
 
@@ -503,57 +619,24 @@ public:
                     return false;
                 }
 
-                auto demuxB = std::make_unique<QProcess>();
-                auto demuxD = std::make_unique<QProcess>();
-                attachStderrLogger(demuxB.get(), "FFmpeg MVC base");
-                attachStderrLogger(demuxD.get(), "FFmpeg MVC dep");
-
-                QObject::connect(demuxB.get(), &QProcess::readyReadStandardOutput, [this, p = demuxB.get()]() {
-                    if (basePipe) basePipe->push(p->readAllStandardOutput());
-                });
-                QObject::connect(demuxB.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), [this]() {
-                    if (basePipe) basePipe->finishInput();
-                });
-                QObject::connect(demuxD.get(), &QProcess::readyReadStandardOutput, [this, p = demuxD.get()]() {
-                    if (depPipe) depPipe->push(p->readAllStandardOutput());
-                });
-                QObject::connect(demuxD.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), [this]() {
-                    if (depPipe) depPipe->finishInput();
-                });
-
-                QStringList baseArgs;
-                baseArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
-                         << "-probesize" << "50M" << "-analyzeduration" << "20M";
-                if (startSec > 0.0) baseArgs << "-ss" << QString::number(startSec, 'f', 3);
-                baseArgs << "-i" << info.mediaPath << "-map" << "0:v:0" << "-c:v" << "copy" << "-f" << "data" << "pipe:1";
-
-                QStringList depArgs;
-                depArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
-                        << "-probesize" << "50M" << "-analyzeduration" << "20M";
-                if (startSec > 0.0) depArgs << "-ss" << QString::number(startSec, 'f', 3);
-                depArgs << "-i" << info.mediaPath << "-map" << "0:v:1" << "-c:v" << "copy" << "-f" << "data" << "pipe:1";
+                ssifDemux = std::make_unique<SsifDemuxThread>(
+                    info.mediaPath, basePipe.get(), depPipe.get(), startSec, info.durationSec);
 
                 QStringList frimArgs;
                 frimArgs << "-sw" << "-i:mvc" << basePipeName << depPipeName << "-tab" << "-o" << "-";
 
                 mux->start(ffmpeg, muxArgs);
                 decoder->start(frim, frimArgs);
-                demuxB->start(ffmpeg, baseArgs);
-                demuxD->start(ffmpeg, depArgs);
+                ssifDemux->start();
 
-                if (!mux->waitForStarted(3000) || !decoder->waitForStarted(3000) ||
-                    !demuxB->waitForStarted(3000) || !demuxD->waitForStarted(3000)) {
-                    if (errorOut) *errorOut = QStringLiteral("Failed to launch the dual-stream Blu-ray 3D FRIMDecode64 / FFmpeg pipeline.");
-                    demuxProc = std::move(demuxB);
-                    demuxDepProc = std::move(demuxD);
+                if (!mux->waitForStarted(3000) || !decoder->waitForStarted(3000)) {
+                    if (errorOut) *errorOut = QStringLiteral("Failed to launch the Blu-ray 3D FRIMDecode64 / FFmpeg pipeline.");
                     frimProc = std::move(decoder);
                     muxProc = std::move(mux);
                     stop(keepExistingMount);
                     return false;
                 }
 
-                demuxProc = std::move(demuxB);
-                demuxDepProc = std::move(demuxD);
                 frimProc = std::move(decoder);
                 muxProc = std::move(mux);
             } else
@@ -573,7 +656,7 @@ public:
                           << "-map" << "0:v:0"
                           << "-c:v" << "copy"
                           << "-bsf:v" << "h264_mp4toannexb"
-                          << "-f" << "data"
+                          << "-f" << "h264"
                           << "pipe:1";
 
                 QStringList frimArgs;
@@ -610,8 +693,8 @@ public:
     void stop(bool keepMount = false) {
         intentionalStop = true;
         stopProcess(demuxProc);
-        stopProcess(demuxDepProc);
 #ifdef Q_OS_WIN
+        if (ssifDemux) { ssifDemux->stopDemux(); ssifDemux.reset(); }
         if (basePipe) { basePipe->closePipe(); basePipe.reset(); }
         if (depPipe) { depPipe->closePipe(); depPipe.reset(); }
 #endif
@@ -723,10 +806,10 @@ private:
     }
 
     std::unique_ptr<QProcess> demuxProc;
-    std::unique_ptr<QProcess> demuxDepProc;
 #ifdef Q_OS_WIN
     std::unique_ptr<WinNamedPipeFeeder> basePipe;
     std::unique_ptr<WinNamedPipeFeeder> depPipe;
+    std::unique_ptr<SsifDemuxThread> ssifDemux;
 #endif
     std::unique_ptr<QProcess> frimProc;
     std::unique_ptr<QProcess> muxProc;
