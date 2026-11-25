@@ -183,6 +183,7 @@ private:
         active = false;
         pendingDetach = false;
         pendingReattach = false;
+        redirectingMvHevc = false;
         savedForceFullscreen = gui->forceStartInFullscreen();
 
         QObject::connect(gui->getCore(), &Core::aboutToStartPlaying, this, [this]() {
@@ -199,22 +200,28 @@ private:
             if (!info.isMvHevc) return;
 
             QString err;
-            if (!mvhevc.start(file, info, stereo.settings().ffmpegPath, &err)) {
+            if (!mvhevc.start(file, info, stereo.settings().ffmpegPath, &err,
+                              [this](const QString &note) { stereo.setBridgeNote(note); })) {
                 stereo.setBridgeNote(err);
                 return;
             }
 
             redirectingMvHevc = true;
+            const quint64 gen = ++mvHevcRedirectGen;
             const QString streamUrl = mvhevc.url();
             const QString title = QFileInfo(file).fileName() + QStringLiteral(" [MV-HEVC 3D]");
-            QTimer::singleShot(150, this, [this, streamUrl, title]() {
-                if (!gui || !gui->getCore()) {
-                    redirectingMvHevc = false;
+
+            gui->getCore()->stop();
+            QTimer::singleShot(250, this, [this, gen, streamUrl, title]() {
+                if (!gui || !gui->getCore() || mvHevcRedirectGen != gen || !mvhevc.isActiveUrl(streamUrl)) {
+                    if (mvHevcRedirectGen == gen) redirectingMvHevc = false;
                     return;
                 }
                 gui->getCore()->addForcedTitle(streamUrl, title);
                 gui->getCore()->openStream(streamUrl);
-                redirectingMvHevc = false;
+            });
+            QTimer::singleShot(6000, this, [this, gen]() {
+                if (mvHevcRedirectGen == gen) redirectingMvHevc = false;
             });
         });
 
@@ -243,12 +250,20 @@ private:
             }
         });
         QObject::connect(gui->getCore(), &Core::mediaStartPlay, this, [this]() {
+            if (redirectingMvHevc && gui && gui->getCore() &&
+                mvhevc.isActiveUrl(gui->getCore()->mdat.filename)) {
+                redirectingMvHevc = false;
+            }
             scheduleLogoClear();
             if (active) quietBackend();
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
         });
         QObject::connect(gui->getCore(), &Core::mediaLoaded, this, [this]() {
+            if (redirectingMvHevc && gui && gui->getCore() &&
+                mvhevc.isActiveUrl(gui->getCore()->mdat.filename)) {
+                redirectingMvHevc = false;
+            }
             scheduleLogoClear();
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
@@ -343,6 +358,7 @@ private:
         return true;
     }
     void release() {
+        redirectingMvHevc = false;
         mvhevc.stop();
         stereo.restoreDisplayMode();
         if (viewport && video && originalParent && viewport->isAttached())
@@ -389,5 +405,6 @@ private:
     bool pendingDetach = false;
     bool pendingReattach = false;
     bool redirectingMvHevc = false;
+    quint64 mvHevcRedirectGen = 0;
 };
 #endif

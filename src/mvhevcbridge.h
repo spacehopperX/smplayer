@@ -7,11 +7,13 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QObject>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
+#include <functional>
 #include <memory>
 
 struct MvHevcProbe {
@@ -113,7 +115,8 @@ public:
     bool start(const QString &sourceFile,
                const MvHevcProbe &info,
                const QString &configuredFfmpeg,
-               QString *errorOut = nullptr) {
+               QString *errorOut = nullptr,
+               std::function<void(const QString &)> onBridgeNote = nullptr) {
         stop();
         const QString ffmpeg = findExecutable(configuredFfmpeg, "ffmpeg");
         if (ffmpeg.isEmpty()) {
@@ -142,15 +145,44 @@ public:
              << "-i" << sourceFile
              << "-filter_complex" << filter
              << "-map" << "[v]"
-             << "-map" << "0:a?"
+             << "-map" << "0:a:0?"
              << "-c:v" << "rawvideo"
              << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "copy"
+             << "-c:a" << "pcm_s16le"
              << "-f" << "nut"
              << listenUrl;
 
+        intentionalStop = false;
+        stderrLog.clear();
+        noteCallback = std::move(onBridgeNote);
+
         auto process = std::make_unique<QProcess>();
         process->setProcessChannelMode(QProcess::MergedChannels);
+        QProcess *rawProc = process.get();
+        QObject::connect(rawProc, &QProcess::readyReadStandardOutput, [this, rawProc]() {
+            const QString chunk = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+            if (!chunk.isEmpty()) {
+                if (!stderrLog.isEmpty()) stderrLog += '\n';
+                stderrLog += chunk;
+                if (stderrLog.size() > 1024) stderrLog = stderrLog.right(1024);
+            }
+        });
+        QObject::connect(rawProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                         [this, rawProc](int exitCode, QProcess::ExitStatus status) {
+            if (intentionalStop) return;
+            const QString tail = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+            if (!tail.isEmpty()) {
+                if (!stderrLog.isEmpty()) stderrLog += '\n';
+                stderrLog += tail;
+            }
+            if ((exitCode != 0 || status != QProcess::NormalExit) && noteCallback) {
+                const QString msg = stderrLog.isEmpty()
+                    ? QString("FFmpeg exited early (code %1)").arg(exitCode)
+                    : QString("FFmpeg exited (%1): %2").arg(exitCode).arg(stderrLog);
+                noteCallback(msg);
+            }
+        });
+
         process->start(ffmpeg, args);
         if (!process->waitForStarted(3000)) {
             if (errorOut) *errorOut = QString("Failed to launch FFmpeg: %1").arg(process->errorString());
@@ -165,6 +197,7 @@ public:
     }
 
     void stop() {
+        intentionalStop = true;
         if (proc) {
             if (proc->state() != QProcess::NotRunning) {
                 proc->terminate();
@@ -205,6 +238,9 @@ private:
     QString activeUrl;
     QString activeSource;
     QString activeSummary;
+    QString stderrLog;
+    std::function<void(const QString &)> noteCallback;
+    bool intentionalStop = false;
 };
 
 #endif
