@@ -522,14 +522,16 @@ public:
                 });
 
                 QStringList baseArgs;
-                baseArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                baseArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
+                         << "-probesize" << "50M" << "-analyzeduration" << "20M";
                 if (startSec > 0.0) baseArgs << "-ss" << QString::number(startSec, 'f', 3);
-                baseArgs << "-i" << info.mediaPath << "-map" << "0:v:0" << "-c:v" << "copy" << "-f" << "h264" << "pipe:1";
+                baseArgs << "-i" << info.mediaPath << "-map" << "0:v:0" << "-c:v" << "copy" << "-f" << "data" << "pipe:1";
 
                 QStringList depArgs;
-                depArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                depArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
+                        << "-probesize" << "50M" << "-analyzeduration" << "20M";
                 if (startSec > 0.0) depArgs << "-ss" << QString::number(startSec, 'f', 3);
-                depArgs << "-i" << info.mediaPath << "-map" << "0:v:1" << "-c:v" << "copy" << "-f" << "h264" << "pipe:1";
+                depArgs << "-i" << info.mediaPath << "-map" << "0:v:1" << "-c:v" << "copy" << "-f" << "data" << "pipe:1";
 
                 QStringList frimArgs;
                 frimArgs << "-sw" << "-i:mvc" << basePipeName << depPipeName << "-tab" << "-o" << "-";
@@ -562,7 +564,8 @@ public:
                 attachStderrLogger(demux.get(), "FFmpeg MVC demux");
 
                 QStringList demuxArgs;
-                demuxArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                demuxArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
+                          << "-probesize" << "50M" << "-analyzeduration" << "20M";
                 if (startSec > 0.0) {
                     demuxArgs << "-ss" << QString::number(startSec, 'f', 3);
                 }
@@ -570,7 +573,7 @@ public:
                           << "-map" << "0:v:0"
                           << "-c:v" << "copy"
                           << "-bsf:v" << "h264_mp4toannexb"
-                          << "-f" << "h264"
+                          << "-f" << "data"
                           << "pipe:1";
 
                 QStringList frimArgs;
