@@ -4,6 +4,7 @@
 #include "smplayer.h"
 #include "basegui.h"
 #include "global.h"
+#include "helper.h"
 #include "preferences.h"
 #include "preferencesdialog.h"
 #include "prefplaybackscreen.h"
@@ -12,6 +13,9 @@
 #include "autohidewidget.h"
 #include "playerprocess.h"
 #include "timeslider.h"
+#ifdef SKINS
+#include "mediapanel.h"
+#endif
 #include <QAction>
 #include <QApplication>
 #include <QEvent>
@@ -97,6 +101,11 @@ protected:
             if (auto *slider = qobject_cast<TimeSlider *>(object)) {
                 hookTimeSlider(slider);
             }
+#ifdef SKINS
+            if (auto *panel = qobject_cast<MediaPanel *>(object)) {
+                hookMediaPanel(panel);
+            }
+#endif
             if (auto *dialog = qobject_cast<PreferencesDialog *>(object)) {
                 if (!editors.contains(dialog)) {
                     auto *page = new PrefPlaybackScreen(dialog);
@@ -130,6 +139,13 @@ protected:
         return QObject::eventFilter(object, event);
     }
 private:
+    static int seekbarResolution() {
+#ifdef SEEKBAR_RESOLUTION
+        return SEEKBAR_RESOLUTION;
+#else
+        return 100;
+#endif
+    }
     void hookTimeSlider(TimeSlider *slider) {
         if (!slider || hookedSliders.contains(slider)) return;
         hookedSliders.insert(slider);
@@ -145,20 +161,54 @@ private:
             seekMvHevcTo(targetSec);
         });
     }
+#ifdef SKINS
+    void hookMediaPanel(MediaPanel *panel) {
+        if (!panel || hookedMediaPanels.contains(panel)) return;
+        hookedMediaPanels.insert(panel);
+        QObject::connect(panel, &QObject::destroyed, this, [this, panel]() {
+            hookedMediaPanels.remove(panel);
+        });
+        QObject::connect(panel, &MediaPanel::seekerChanged, this, [this](int pos) {
+            if (!mvhevc.isActive() || redirectingMvHevc) return;
+            const double dur = mvhevc.durationSec();
+            if (dur <= 0.0) return;
+            const double targetSec = (static_cast<double>(pos) / static_cast<double>(seekbarResolution())) * dur;
+            seekMvHevcTo(targetSec);
+        });
+    }
+#endif
     void syncMvHevcTimeline(double currentSec = -1.0) {
         if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
         const double dur = mvhevc.durationSec();
         if (dur <= 0.0) return;
+        if (currentSec >= 0.0) lastMvHevcSec = currentSec;
+        const double displaySec = (currentSec >= 0.0) ? currentSec : lastMvHevcSec;
         gui->getCore()->mdat.duration = dur;
+
         for (TimeSlider *slider : hookedSliders) {
             if (!slider) continue;
             slider->setDuration(dur);
-            if (currentSec >= 0.0) {
+            if (displaySec >= 0.0) {
                 const int maxVal = qMax(1, slider->maximum());
-                const int pos = qBound(0, qRound((currentSec / dur) * maxVal), maxVal);
+                const int pos = qBound(0, qRound((displaySec / dur) * maxVal), maxVal);
                 slider->setPos(pos);
             }
         }
+#ifdef SKINS
+        const int res = seekbarResolution();
+        const int skinPos = (displaySec >= 0.0) ? qBound(0, qRound((displaySec / dur) * res), res) : 0;
+        const QString totalStr = Helper::formatTime(static_cast<int>(dur));
+        const QString elapsedStr = Helper::formatTime(static_cast<int>(qMax(0.0, displaySec)));
+        for (MediaPanel *panel : hookedMediaPanels) {
+            if (!panel) continue;
+            panel->setDuration(static_cast<int>(dur));
+            panel->setTotalText(totalStr);
+            if (displaySec >= 0.0) {
+                panel->setElapsedText(elapsedStr);
+                panel->setSeeker(skinPos);
+            }
+        }
+#endif
     }
     void configureMvHevcMpvCache() {
         if (!gui || !gui->getCore() || !mvhevc.isActive()) return;
@@ -186,6 +236,7 @@ private:
             return;
         }
 
+        lastMvHevcSec = clamped;
         redirectingMvHevc = true;
         const quint64 gen = ++mvHevcRedirectGen;
         const QString streamUrl = mvhevc.url();
@@ -257,6 +308,12 @@ private:
         for (TimeSlider *slider : gui->findChildren<TimeSlider *>()) {
             hookTimeSlider(slider);
         }
+#ifdef SKINS
+        hookedMediaPanels.clear();
+        for (MediaPanel *panel : gui->findChildren<MediaPanel *>()) {
+            hookMediaPanel(panel);
+        }
+#endif
         if (viewport) {
             viewport->hide();
             viewport->deleteLater();
@@ -267,6 +324,7 @@ private:
         pendingDetach = false;
         pendingReattach = false;
         redirectingMvHevc = false;
+        lastMvHevcSec = 0.0;
         savedForceFullscreen = gui->forceStartInFullscreen();
 
         QObject::connect(gui->getCore(), &Core::aboutToStartPlaying, this, [this]() {
@@ -276,6 +334,7 @@ private:
             if (redirectingMvHevc) return;
 
             mvhevc.stop();
+            lastMvHevcSec = 0.0;
             stereo.setBridgeNote(QString());
             if (!stereo.settings().enableMvHevcBridge) return;
 
@@ -319,6 +378,7 @@ private:
             } else if (state == Core::Stopped) {
                 if (!redirectingMvHevc) {
                     mvhevc.stop();
+                    lastMvHevcSec = 0.0;
                     if (active && viewport) viewport->setVideoVisible(false);
                     stereo.onPlaybackStopped(gui, [this]() { reapplyViewportGeometry(); });
                     if (pendingReattach && !active) {
@@ -348,7 +408,7 @@ private:
             scheduleLogoClear();
             if (active) quietBackend();
             configureMvHevcMpvCache();
-            syncMvHevcTimeline();
+            syncMvHevcTimeline(lastMvHevcSec);
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
         });
@@ -360,7 +420,7 @@ private:
             if (active && viewport) viewport->setVideoVisible(true);
             scheduleLogoClear();
             configureMvHevcMpvCache();
-            syncMvHevcTimeline();
+            syncMvHevcTimeline(lastMvHevcSec);
             stereo.applyForActiveMedia(gui, activeScreenName(), [this]() { reapplyViewportGeometry(); },
                                        mvhevc.isActive(), mvhevc.summary());
         });
@@ -368,7 +428,9 @@ private:
             if (mvhevc.isActive()) syncMvHevcTimeline(sec);
         });
         QObject::connect(gui->getCore(), &Core::newDuration, this, [this](double) {
-            if (mvhevc.isActive()) syncMvHevcTimeline();
+            if (mvhevc.isActive()) {
+                QTimer::singleShot(0, this, [this]() { syncMvHevcTimeline(); });
+            }
         });
         QObject::connect(gui.data(), &QObject::destroyed, this, [this]() {
             if (viewport) {
@@ -462,6 +524,7 @@ private:
     void release() {
         redirectingMvHevc = false;
         mvhevc.stop();
+        lastMvHevcSec = 0.0;
         stereo.restoreDisplayMode();
         if (viewport && video && originalParent && viewport->isAttached())
             viewport->detachVideo(video, originalParent);
@@ -500,6 +563,9 @@ private:
     QMap<PreferencesDialog *, PrefPlaybackScreen *> editors;
     QMap<QAction *, bool> disabled;
     QSet<TimeSlider *> hookedSliders;
+#ifdef SKINS
+    QSet<MediaPanel *> hookedMediaPanels;
+#endif
     PlaybackScreenChoice current;
     MvHevcBridge mvhevc;
     Stereo3DController stereo;
@@ -509,5 +575,6 @@ private:
     bool pendingReattach = false;
     bool redirectingMvHevc = false;
     quint64 mvHevcRedirectGen = 0;
+    double lastMvHevcSec = 0.0;
 };
 #endif
