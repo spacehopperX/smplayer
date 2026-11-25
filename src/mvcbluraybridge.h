@@ -5,6 +5,7 @@
 #include "mvhevcbridge.h"
 #include "global.h"
 #include "preferences.h"
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
@@ -16,12 +17,21 @@
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 
 struct MvcBlurayProbe {
     bool isMvc = false;
     bool nativeFfmpegMultiview = false;
+    bool dualVideoStreams = false;
     bool hasSubtitles = false;
     int leftView = 0;
     int rightView = 1;
@@ -31,6 +41,114 @@ struct MvcBlurayProbe {
     QString mountedIsoPath;
     QString summary;
 };
+
+#ifdef Q_OS_WIN
+class WinNamedPipeFeeder {
+public:
+    WinNamedPipeFeeder() = default;
+    ~WinNamedPipeFeeder() { close(); }
+
+    bool create(const QString &name) {
+        close();
+        pipeName = name;
+        const std::wstring wname = name.toStdWString();
+        handle = CreateNamedPipeW(
+            wname.c_str(),
+            PIPE_ACCESS_OUTBOUND,
+            PIPE_TYPE_BYTE | PIPE_WAIT,
+            1,
+            2 * 1024 * 1024,
+            2 * 1024 * 1024,
+            0,
+            nullptr);
+        if (handle == INVALID_HANDLE_VALUE) return false;
+
+        stopping.store(false);
+        eof.store(false);
+        worker = std::thread([this]() { run(); });
+        return true;
+    }
+
+    QString name() const { return pipeName; }
+
+    void push(const QByteArray &data) {
+        if (data.isEmpty() || stopping.load()) return;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            queue.push_back(data);
+        }
+        cv.notify_one();
+    }
+
+    void finishInput() {
+        eof.store(true);
+        cv.notify_one();
+    }
+
+    void close() {
+        stopping.store(true);
+        eof.store(true);
+        cv.notify_all();
+        if (handle != INVALID_HANDLE_VALUE) {
+            CancelIoEx(handle, nullptr);
+            // Unblock ConnectNamedPipe if no client ever connected.
+            const std::wstring wname = pipeName.toStdWString();
+            HANDLE dummy = CreateFileW(wname.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (dummy != INVALID_HANDLE_VALUE) CloseHandle(dummy);
+        }
+        if (worker.joinable()) worker.join();
+        if (handle != INVALID_HANDLE_VALUE) {
+            DisconnectNamedPipe(handle);
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        queue.clear();
+    }
+
+private:
+    void run() {
+        if (!ConnectNamedPipe(handle, nullptr)) {
+            if (GetLastError() != ERROR_PIPE_CONNECTED) return;
+        }
+        while (!stopping.load()) {
+            QByteArray chunk;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [this]() { return stopping.load() || eof.load() || !queue.empty(); });
+                if (stopping.load()) break;
+                if (queue.empty()) {
+                    if (eof.load()) break;
+                    continue;
+                }
+                chunk = std::move(queue.front());
+                queue.pop_front();
+            }
+            const char *ptr = chunk.constData();
+            int remaining = chunk.size();
+            while (remaining > 0 && !stopping.load()) {
+                DWORD written = 0;
+                if (!WriteFile(handle, ptr, static_cast<DWORD>(remaining), &written, nullptr) || written == 0) {
+                    stopping.store(true);
+                    break;
+                }
+                ptr += written;
+                remaining -= static_cast<int>(written);
+            }
+        }
+        FlushFileBuffers(handle);
+    }
+
+    QString pipeName;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::deque<QByteArray> queue;
+    std::atomic<bool> stopping{false};
+    std::atomic<bool> eof{false};
+    std::thread worker;
+};
+#endif
 
 class MvcBlurayBridge {
 public:
@@ -69,7 +187,6 @@ public:
         const QString trimmed = filePath.trimmed();
         if (trimmed.isEmpty()) return QString();
 
-        // Handle SMPlayer/mpv Blu-ray URLs: br://..., bd://..., bluray://...
         static const QRegularExpression reBlurayUrl(
             QStringLiteral("^(?:br|bd|bluray)://(?:[0-9]*)/*(.*)$"),
             QRegularExpression::CaseInsensitiveOption);
@@ -87,7 +204,6 @@ public:
             return QString();
         }
 
-        // Handle mounted Blu-ray drive or folder directly (e.g. E:/, E:\BDMV, etc.)
         const QFileInfo fi(trimmed);
         if (fi.exists() && fi.isDir()) {
             return QDir::fromNativeSeparators(fi.absoluteFilePath());
@@ -135,6 +251,7 @@ public:
             const QString largestSsif = findLargestSsif(ssifDir);
             if (largestSsif.isEmpty()) return res;
             res.isMvc = true;
+            res.dualVideoStreams = true;
             res.mediaPath = largestSsif;
             targetMedia = largestSsif;
             ext = QStringLiteral("ssif");
@@ -154,6 +271,7 @@ public:
                     return res;
                 }
                 res.isMvc = true;
+                res.dualVideoStreams = true;
                 res.mountedIsoPath = fi.absoluteFilePath();
                 res.mediaPath = largestSsif;
                 targetMedia = largestSsif;
@@ -163,6 +281,7 @@ public:
 #endif
             } else if (ext == "ssif") {
                 res.isMvc = true;
+                res.dualVideoStreams = true;
                 res.mediaPath = targetMedia;
                 res.summary = QStringLiteral("Blu-ray 3D SSIF (H.264 MVC -> Full-TAB)");
             } else {
@@ -184,11 +303,14 @@ public:
                 QStringList viewIds;
                 QStringList viewPos;
                 bool hasStereoProfile = false;
+                int videoCount = 0;
                 QString firstFps;
 
                 for (const QString &rawLine : out.split('\n')) {
                     const QString line = rawLine.trimmed();
-                    if (line == "codec_type=subtitle") {
+                    if (line == "codec_type=video") {
+                        ++videoCount;
+                    } else if (line == "codec_type=subtitle") {
                         res.hasSubtitles = true;
                     } else if (line.startsWith("view_ids_available=")) {
                         viewIds = line.mid(QStringLiteral("view_ids_available=").size()).split(',', Qt::SkipEmptyParts);
@@ -210,6 +332,7 @@ public:
                 }
 
                 if (!firstFps.isEmpty()) res.fps = firstFps;
+                if (videoCount >= 2) res.dualVideoStreams = true;
 
                 if (viewIds.size() >= 2) {
                     res.isMvc = true;
@@ -329,28 +452,12 @@ public:
                 return false;
             }
 
-            auto demux = std::make_unique<QProcess>();
             auto decoder = std::make_unique<QProcess>();
             auto mux = std::make_unique<QProcess>();
-
-            demux->setStandardOutputProcess(decoder.get());
+            decoder->setWorkingDirectory(QFileInfo(frim).absolutePath());
             decoder->setStandardOutputProcess(mux.get());
+            attachStderrLogger(decoder.get(), "FRIMDecode64");
             attachStderrLogger(mux.get(), "FFmpeg MVC mux");
-
-            QStringList demuxArgs;
-            demuxArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
-            if (startSec > 0.0) {
-                demuxArgs << "-ss" << QString::number(startSec, 'f', 3);
-            }
-            demuxArgs << "-i" << info.mediaPath
-                      << "-map" << "0:v:0"
-                      << "-c:v" << "copy"
-                      << "-bsf:v" << "h264_mp4toannexb"
-                      << "-f" << "h264"
-                      << "pipe:1";
-
-            QStringList frimArgs;
-            frimArgs << "-sw" << "-i:mvc" << "-" << "-tab" << "-o" << "-";
 
             QStringList muxArgs;
             muxArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin"
@@ -384,22 +491,108 @@ public:
                     << "-f" << "nut"
                     << listenUrl;
 
-            mux->start(ffmpeg, muxArgs);
-            decoder->start(frim, frimArgs);
-            demux->start(ffmpeg, demuxArgs);
+#ifdef Q_OS_WIN
+            if (info.dualVideoStreams) {
+                const QString basePipeName = QString("\\\\.\\pipe\\smplayer_mvc_base_%1").arg(port);
+                const QString depPipeName = QString("\\\\.\\pipe\\smplayer_mvc_dep_%1").arg(port);
+                basePipe = std::make_unique<WinNamedPipeFeeder>();
+                depPipe = std::make_unique<WinNamedPipeFeeder>();
+                if (!basePipe->create(basePipeName) || !depPipe->create(depPipeName)) {
+                    if (errorOut) *errorOut = QStringLiteral("Failed to create Windows named pipes for Blu-ray 3D MVC streams.");
+                    stop(keepExistingMount);
+                    return false;
+                }
 
-            if (!mux->waitForStarted(3000) || !decoder->waitForStarted(3000) || !demux->waitForStarted(3000)) {
-                if (errorOut) *errorOut = QStringLiteral("Failed to launch the FRIMDecode64 / FFmpeg real-time MVC pipeline.");
+                auto demuxB = std::make_unique<QProcess>();
+                auto demuxD = std::make_unique<QProcess>();
+                attachStderrLogger(demuxB.get(), "FFmpeg MVC base");
+                attachStderrLogger(demuxD.get(), "FFmpeg MVC dep");
+
+                QObject::connect(demuxB.get(), &QProcess::readyReadStandardOutput, [this, p = demuxB.get()]() {
+                    if (basePipe) basePipe->push(p->readAllStandardOutput());
+                });
+                QObject::connect(demuxB.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), [this]() {
+                    if (basePipe) basePipe->finishInput();
+                });
+                QObject::connect(demuxD.get(), &QProcess::readyReadStandardOutput, [this, p = demuxD.get()]() {
+                    if (depPipe) depPipe->push(p->readAllStandardOutput());
+                });
+                QObject::connect(demuxD.get(), QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), [this]() {
+                    if (depPipe) depPipe->finishInput();
+                });
+
+                QStringList baseArgs;
+                baseArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                if (startSec > 0.0) baseArgs << "-ss" << QString::number(startSec, 'f', 3);
+                baseArgs << "-i" << info.mediaPath << "-map" << "0:v:0" << "-c:v" << "copy" << "-f" << "h264" << "pipe:1";
+
+                QStringList depArgs;
+                depArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                if (startSec > 0.0) depArgs << "-ss" << QString::number(startSec, 'f', 3);
+                depArgs << "-i" << info.mediaPath << "-map" << "0:v:1" << "-c:v" << "copy" << "-f" << "h264" << "pipe:1";
+
+                QStringList frimArgs;
+                frimArgs << "-sw" << "-i:mvc" << basePipeName << depPipeName << "-tab" << "-o" << "-";
+
+                mux->start(ffmpeg, muxArgs);
+                decoder->start(frim, frimArgs);
+                demuxB->start(ffmpeg, baseArgs);
+                demuxD->start(ffmpeg, depArgs);
+
+                if (!mux->waitForStarted(3000) || !decoder->waitForStarted(3000) ||
+                    !demuxB->waitForStarted(3000) || !demuxD->waitForStarted(3000)) {
+                    if (errorOut) *errorOut = QStringLiteral("Failed to launch the dual-stream Blu-ray 3D FRIMDecode64 / FFmpeg pipeline.");
+                    demuxProc = std::move(demuxB);
+                    demuxDepProc = std::move(demuxD);
+                    frimProc = std::move(decoder);
+                    muxProc = std::move(mux);
+                    stop(keepExistingMount);
+                    return false;
+                }
+
+                demuxProc = std::move(demuxB);
+                demuxDepProc = std::move(demuxD);
+                frimProc = std::move(decoder);
+                muxProc = std::move(mux);
+            } else
+#endif
+            {
+                auto demux = std::make_unique<QProcess>();
+                demux->setStandardOutputProcess(decoder.get());
+                attachStderrLogger(demux.get(), "FFmpeg MVC demux");
+
+                QStringList demuxArgs;
+                demuxArgs << "-hide_banner" << "-loglevel" << "error" << "-nostdin";
+                if (startSec > 0.0) {
+                    demuxArgs << "-ss" << QString::number(startSec, 'f', 3);
+                }
+                demuxArgs << "-i" << info.mediaPath
+                          << "-map" << "0:v:0"
+                          << "-c:v" << "copy"
+                          << "-bsf:v" << "h264_mp4toannexb"
+                          << "-f" << "h264"
+                          << "pipe:1";
+
+                QStringList frimArgs;
+                frimArgs << "-sw" << "-i:mvc" << "-" << "-tab" << "-o" << "-";
+
+                mux->start(ffmpeg, muxArgs);
+                decoder->start(frim, frimArgs);
+                demux->start(ffmpeg, demuxArgs);
+
+                if (!mux->waitForStarted(3000) || !decoder->waitForStarted(3000) || !demux->waitForStarted(3000)) {
+                    if (errorOut) *errorOut = QStringLiteral("Failed to launch the FRIMDecode64 / FFmpeg real-time MVC pipeline.");
+                    demuxProc = std::move(demux);
+                    frimProc = std::move(decoder);
+                    muxProc = std::move(mux);
+                    stop(keepExistingMount);
+                    return false;
+                }
+
                 demuxProc = std::move(demux);
                 frimProc = std::move(decoder);
                 muxProc = std::move(mux);
-                stop(keepExistingMount);
-                return false;
             }
-
-            demuxProc = std::move(demux);
-            frimProc = std::move(decoder);
-            muxProc = std::move(mux);
         }
 
         activeUrl = QString("tcp://127.0.0.1:%1").arg(port);
@@ -414,6 +607,11 @@ public:
     void stop(bool keepMount = false) {
         intentionalStop = true;
         stopProcess(demuxProc);
+        stopProcess(demuxDepProc);
+#ifdef Q_OS_WIN
+        if (basePipe) { basePipe->close(); basePipe.reset(); }
+        if (depPipe) { depPipe->close(); depPipe.reset(); }
+#endif
         stopProcess(frimProc);
         stopProcess(muxProc);
         if (!keepMount && !mountedIso.isEmpty()) {
@@ -439,22 +637,22 @@ public:
 private:
     void attachStderrLogger(QProcess *rawProc, const QString &label) {
         if (!rawProc) return;
-        rawProc->setProcessChannelMode(QProcess::MergedChannels);
-        QObject::connect(rawProc, &QProcess::readyReadStandardOutput, [this, rawProc]() {
-            const QString chunk = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+        QObject::connect(rawProc, &QProcess::readyReadStandardError, [this, rawProc, label]() {
+            const QString chunk = QString::fromUtf8(rawProc->readAllStandardError()).trimmed();
             if (!chunk.isEmpty()) {
                 if (!stderrLog.isEmpty()) stderrLog += '\n';
-                stderrLog += chunk;
-                if (stderrLog.size() > 1024) stderrLog = stderrLog.right(1024);
+                stderrLog += QString("[%1] %2").arg(label, chunk);
+                if (stderrLog.size() > 1200) stderrLog = stderrLog.right(1200);
+                if (noteCallback && !intentionalStop) noteCallback(stderrLog);
             }
         });
         QObject::connect(rawProc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
                          [this, rawProc, label](int exitCode, QProcess::ExitStatus status) {
             if (intentionalStop) return;
-            const QString tail = QString::fromUtf8(rawProc->readAllStandardOutput()).trimmed();
+            const QString tail = QString::fromUtf8(rawProc->readAllStandardError()).trimmed();
             if (!tail.isEmpty()) {
                 if (!stderrLog.isEmpty()) stderrLog += '\n';
-                stderrLog += tail;
+                stderrLog += QString("[%1] %2").arg(label, tail);
             }
             if ((exitCode != 0 || status != QProcess::NormalExit) && noteCallback) {
                 const QString msg = stderrLog.isEmpty()
@@ -522,6 +720,11 @@ private:
     }
 
     std::unique_ptr<QProcess> demuxProc;
+    std::unique_ptr<QProcess> demuxDepProc;
+#ifdef Q_OS_WIN
+    std::unique_ptr<WinNamedPipeFeeder> basePipe;
+    std::unique_ptr<WinNamedPipeFeeder> depPipe;
+#endif
     std::unique_ptr<QProcess> frimProc;
     std::unique_ptr<QProcess> muxProc;
     QString mountedIso;
