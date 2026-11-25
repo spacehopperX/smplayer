@@ -5,25 +5,26 @@
 #include "mvhevcbridge.h"
 #include "global.h"
 #include "preferences.h"
+#include <QAtomicInt>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QHostAddress>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QObject>
 #include <QProcess>
+#include <QQueue>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
-#include <atomic>
-#include <condition_variable>
-#include <deque>
+#include <QThread>
+#include <QWaitCondition>
 #include <functional>
 #include <memory>
-#include <mutex>
-#include <thread>
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
@@ -43,13 +44,13 @@ struct MvcBlurayProbe {
 };
 
 #ifdef Q_OS_WIN
-class WinNamedPipeFeeder {
+class WinNamedPipeFeeder : public QThread {
 public:
     WinNamedPipeFeeder() = default;
-    ~WinNamedPipeFeeder() { close(); }
+    ~WinNamedPipeFeeder() override { closePipe(); }
 
     bool create(const QString &name) {
-        close();
+        closePipe();
         pipeName = name;
         const std::wstring wname = name.toStdWString();
         handle = CreateNamedPipeW(
@@ -63,73 +64,72 @@ public:
             nullptr);
         if (handle == INVALID_HANDLE_VALUE) return false;
 
-        stopping.store(false);
-        eof.store(false);
-        worker = std::thread([this]() { run(); });
+        stopping.storeRelaxed(0);
+        eof.storeRelaxed(0);
+        start();
         return true;
     }
 
     QString name() const { return pipeName; }
 
     void push(const QByteArray &data) {
-        if (data.isEmpty() || stopping.load()) return;
-        {
-            std::lock_guard<std::mutex> lk(mtx);
-            queue.push_back(data);
-        }
-        cv.notify_one();
+        if (data.isEmpty() || stopping.loadRelaxed()) return;
+        QMutexLocker lk(&mtx);
+        queue.enqueue(data);
+        cv.wakeOne();
     }
 
     void finishInput() {
-        eof.store(true);
-        cv.notify_one();
+        eof.storeRelaxed(1);
+        cv.wakeOne();
     }
 
-    void close() {
-        stopping.store(true);
-        eof.store(true);
-        cv.notify_all();
+    void closePipe() {
+        stopping.storeRelaxed(1);
+        eof.storeRelaxed(1);
+        cv.wakeAll();
         if (handle != INVALID_HANDLE_VALUE) {
-            CancelIoEx(handle, nullptr);
-            // Unblock ConnectNamedPipe if no client ever connected.
             const std::wstring wname = pipeName.toStdWString();
             HANDLE dummy = CreateFileW(wname.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
             if (dummy != INVALID_HANDLE_VALUE) CloseHandle(dummy);
         }
-        if (worker.joinable()) worker.join();
+        if (isRunning()) {
+            wait(1500);
+        }
         if (handle != INVALID_HANDLE_VALUE) {
             DisconnectNamedPipe(handle);
             CloseHandle(handle);
             handle = INVALID_HANDLE_VALUE;
         }
-        std::lock_guard<std::mutex> lk(mtx);
+        QMutexLocker lk(&mtx);
         queue.clear();
     }
 
-private:
-    void run() {
+protected:
+    void run() override {
         if (!ConnectNamedPipe(handle, nullptr)) {
             if (GetLastError() != ERROR_PIPE_CONNECTED) return;
         }
-        while (!stopping.load()) {
+        while (!stopping.loadRelaxed()) {
             QByteArray chunk;
             {
-                std::unique_lock<std::mutex> lk(mtx);
-                cv.wait(lk, [this]() { return stopping.load() || eof.load() || !queue.empty(); });
-                if (stopping.load()) break;
-                if (queue.empty()) {
-                    if (eof.load()) break;
+                QMutexLocker lk(&mtx);
+                while (!stopping.loadRelaxed() && !eof.loadRelaxed() && queue.isEmpty()) {
+                    cv.wait(&mtx, 100);
+                }
+                if (stopping.loadRelaxed()) break;
+                if (queue.isEmpty()) {
+                    if (eof.loadRelaxed()) break;
                     continue;
                 }
-                chunk = std::move(queue.front());
-                queue.pop_front();
+                chunk = queue.dequeue();
             }
             const char *ptr = chunk.constData();
             int remaining = chunk.size();
-            while (remaining > 0 && !stopping.load()) {
+            while (remaining > 0 && !stopping.loadRelaxed()) {
                 DWORD written = 0;
                 if (!WriteFile(handle, ptr, static_cast<DWORD>(remaining), &written, nullptr) || written == 0) {
-                    stopping.store(true);
+                    stopping.storeRelaxed(1);
                     break;
                 }
                 ptr += written;
@@ -139,14 +139,14 @@ private:
         FlushFileBuffers(handle);
     }
 
+private:
     QString pipeName;
     HANDLE handle = INVALID_HANDLE_VALUE;
-    std::mutex mtx;
-    std::condition_variable cv;
-    std::deque<QByteArray> queue;
-    std::atomic<bool> stopping{false};
-    std::atomic<bool> eof{false};
-    std::thread worker;
+    QMutex mtx;
+    QWaitCondition cv;
+    QQueue<QByteArray> queue;
+    QAtomicInt stopping{0};
+    QAtomicInt eof{0};
 };
 #endif
 
@@ -609,8 +609,8 @@ public:
         stopProcess(demuxProc);
         stopProcess(demuxDepProc);
 #ifdef Q_OS_WIN
-        if (basePipe) { basePipe->close(); basePipe.reset(); }
-        if (depPipe) { depPipe->close(); depPipe.reset(); }
+        if (basePipe) { basePipe->closePipe(); basePipe.reset(); }
+        if (depPipe) { depPipe->closePipe(); depPipe.reset(); }
 #endif
         stopProcess(frimProc);
         stopProcess(muxProc);
