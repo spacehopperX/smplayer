@@ -17,6 +17,7 @@
 #include <QObject>
 #include <QProcess>
 #include <QQueue>
+#include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QString>
@@ -162,7 +163,7 @@ private:
     QAtomicInt eof{0};
 };
 
-// Robust Blu-ray 3D BDAV (192-byte MPEG-TS) demuxer.
+// Direct Blu-ray 3D BDAV (192-byte MPEG-TS) demuxer.
 // Reassembles complete PES packets for PID 0x1011 (AVC base) and PID 0x1012 (MVC dependent)
 // before feeding them to FRIMDecode64, ensuring pristine stream headers and perfect L/R sync.
 class SsifDemuxThread : public QThread {
@@ -511,16 +512,27 @@ public:
             return false;
         }
 
-        QTcpServer probeServer;
-        if (!probeServer.listen(QHostAddress::LocalHost, 0)) {
-            if (errorOut) *errorOut = QStringLiteral("Failed to reserve a local TCP port for the H.264 MVC bridge.");
-            stop(keepExistingMount);
-            return false;
-        }
-        const quint16 port = probeServer.serverPort();
-        probeServer.close();
+        const quint32 pipeId = QRandomGenerator::global()->generate();
+#ifdef Q_OS_WIN
+        const QString finalPipeName = QString("\\\\.\\pipe\\smplayer_mvc_out_%1").arg(pipeId);
+        const std::wstring wname = finalPipeName.toStdWString();
+        outPipeHandle = CreateNamedPipeW(
+            wname.c_str(),
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_WAIT,
+            1,
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+            0,
+            nullptr);
+        const QString outTarget = finalPipeName;
+        activeUrl = finalPipeName;
+#else
+        const quint16 port = 10000 + (pipeId % 50000);
+        const QString outTarget = QString("tcp://127.0.0.1:%1?listen=1").arg(port);
+        activeUrl = QString("tcp://127.0.0.1:%1").arg(port);
+#endif
 
-        const QString listenUrl = QString("tcp://127.0.0.1:%1?listen=1").arg(port);
         const bool overlayPgs = (burnStereoPgs && info.hasSubtitles);
         const int halfShift = (swapEyes ? -pgsDepthPx : pgsDepthPx) / 2;
 
@@ -555,7 +567,7 @@ public:
                  << "-c:v" << "rawvideo" << "-pix_fmt" << "yuv420p"
                  << "-c:a" << "pcm_s16le"
                  << "-f" << "nut"
-                 << listenUrl;
+                 << "-y" << outTarget;
 
             auto mux = std::make_unique<QProcess>();
             attachStderrLogger(mux.get(), "FFmpeg MVC");
@@ -613,12 +625,12 @@ public:
                     << "-c:v" << "rawvideo" << "-pix_fmt" << "yuv420p"
                     << "-c:a" << "pcm_s16le"
                     << "-f" << "nut"
-                    << listenUrl;
+                    << "-y" << outTarget;
 
 #ifdef Q_OS_WIN
             if (info.dualVideoStreams) {
-                const QString basePipeName = QString("\\\\.\\pipe\\smplayer_mvc_base_%1").arg(port);
-                const QString depPipeName = QString("\\\\.\\pipe\\smplayer_mvc_dep_%1").arg(port);
+                const QString basePipeName = QString("\\\\.\\pipe\\smplayer_mvc_base_%1").arg(pipeId);
+                const QString depPipeName = QString("\\\\.\\pipe\\smplayer_mvc_dep_%1").arg(pipeId);
                 basePipe = std::make_unique<WinNamedPipeFeeder>();
                 depPipe = std::make_unique<WinNamedPipeFeeder>();
                 if (!basePipe->create(basePipeName) || !depPipe->create(depPipeName)) {
@@ -689,7 +701,6 @@ public:
             }
         }
 
-        activeUrl = QString("tcp://127.0.0.1:%1").arg(port);
         activeSummary = overlayPgs
             ? (info.summary + QStringLiteral(" + 3D PGS subs"))
             : info.summary;
@@ -705,6 +716,10 @@ public:
         if (ssifDemux) { ssifDemux->stopDemux(); ssifDemux.reset(); }
         if (basePipe) { basePipe->closePipe(); basePipe.reset(); }
         if (depPipe) { depPipe->closePipe(); depPipe.reset(); }
+        if (outPipeHandle != INVALID_HANDLE_VALUE) {
+            CloseHandle(outPipeHandle);
+            outPipeHandle = INVALID_HANDLE_VALUE;
+        }
 #endif
         stopProcess(frimProc);
         stopProcess(muxProc);
@@ -818,6 +833,7 @@ private:
     std::unique_ptr<WinNamedPipeFeeder> basePipe;
     std::unique_ptr<WinNamedPipeFeeder> depPipe;
     std::unique_ptr<SsifDemuxThread> ssifDemux;
+    HANDLE outPipeHandle = INVALID_HANDLE_VALUE;
 #endif
     std::unique_ptr<QProcess> frimProc;
     std::unique_ptr<QProcess> muxProc;
