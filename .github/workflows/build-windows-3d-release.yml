@@ -2,7 +2,7 @@ name: Build Windows 3D Fork Release
 
 on:
   push:
-    branches: [master, milestone-1-dual-screen]
+    branches: [master, milestone-1-dual-screen, milestone-2-3d-output, milestone-3-mvhevc, milestone-4-stereo-subs, milestone-5-mvc-bluray]
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [installer, portable]
+        package: [portable]
     steps:
       - name: Checkout build harness
         uses: actions/checkout@v4
@@ -148,7 +148,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download both packages
+      - name: Download built packages
         uses: actions/download-artifact@v4
         with:
           pattern: windows-*
@@ -159,9 +159,8 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          test "$(find . -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 1
-          sha256sum *.exe *.zip > SHA256SUMS.txt
+          sha256sum *.zip > SHA256SUMS.txt
       - name: Publish commit-specific prerelease
         uses: softprops/action-gh-release@v2
         with:
@@ -172,10 +171,8 @@ jobs:
           make_latest: false
           fail_on_unmatched_files: true
           body: |
-            Windows x64 development packages built from ${{ github.sha }}.
-            Installer is unsigned. Portable ZIP contains the unpacked application.
+            Windows x64 portable development package built from ${{ github.sha }}.
             Successful packaging does not establish hardware playback compatibility.
           files: |
-            release/*.exe
             release/*.zip
             release/SHA256SUMS.txt
